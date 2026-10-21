@@ -233,3 +233,9 @@ is only a comparison run.
 - E4.5 first run (2026-10-21) was **invalid**: `pm_test_delay` is 5 s, so the
   system resumed after 5 s and the post hook cleared the 30 s alarm before it
   could fire. The probe now raises `pm_test_delay` to alarm + 10 s for the run.
+- **Candidate 50, E4 second run: same as the first** (no oops, USB resume
+  error only). **E4.5 (alarm 30 s, pm_test held 40 s): the RTC alarm fired
+  and woke the system** (`rtc alarm irq: +1`, `pm_wakeup_irq: 220` =
+  `pm8xxx_rtc_alarm`, `c400000.spmi:pmic@0:rtc@6100` wakeup events +2), with
+  the same USB resume error. No-sleep rungs E1-E4.5 are complete on
+  candidate 50.
