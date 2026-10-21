@@ -999,6 +999,12 @@ def cmd_probe(args: argparse.Namespace) -> int:
     print(f"verdict: {verdict}")
     print(f"wlan: idle shutdowns {wlan['idle_shutdown']}, idle restarts "
           f"{wlan['idle_restart']}, oopses {wlan['oops']}")
+    if attempt.alarm_s > 0:
+        # Reported on its own: a resume error elsewhere decides the verdict
+        # first and would hide whether the alarm fired.
+        fired = (ro.get("irqs_after", {}).get("pm8xxx_rtc_alarm", 0)
+                 - irq_before.get("pm8xxx_rtc_alarm", 0))
+        print(f"rtc alarm irq: +{fired} ({'fired' if fired > 0 else 'did NOT fire'})")
     if state.get("abort_reason"):
         print(f"abort reason: {state['abort_reason']}")
     for k in ("pm_wakeup_irq", "wakeup_diff", "panel_post", "root_ro", "restore_errors"):
