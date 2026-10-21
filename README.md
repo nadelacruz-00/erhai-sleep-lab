@@ -4,8 +4,11 @@ A test lab for suspend/resume on the OnePlus Pad 3 (`erhai`, Snapdragon 8 Elite
 / SM8750) running Ubuntu on the mainline port at
 [TheMojoMan/oneplus-erhai-linux](https://github.com/TheMojoMan/oneplus-erhai-linux).
 
-On that port the tablet enters suspend but never comes back. The lab's first
-job is to find out **how** it fails, not to guess: every sleep attempt leaves a
+On that port suspend is unreliable: sometimes the tablet does not come back.
+The port's author has had it resume after an overnight sleep (on the 7.2
+kernel line), and suspend has not been the focus of the 7.3 work since. The
+lab's first job is to find out **how often and how** it fails, not to guess:
+every sleep attempt leaves a
 record that survives a forced restart, and the next boot files it as one of a
 small set of failure classes (wake never arrived, a driver hung on resume, a
 silent reset during entry or during resume, or resume completed with the panel

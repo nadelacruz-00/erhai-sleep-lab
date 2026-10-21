@@ -56,6 +56,10 @@ if [ -f "$CDIR/extra.config" ]; then
 fi
 
 # ------------------------------------------------------------------- build ---
+# scripts/setlocalversion appends "+" to the kernelrelease when the tree is a
+# git checkout off a release tag and LOCALVERSION is unset. Set it (empty) so
+# the release is exactly <base>-sm8750-themojoman-lab-<candidate>.
+export LOCALVERSION=
 # DEB_REV is fixed: the .deb the tree script packs is discarded, a lab kernel
 # is never installed with dpkg (it would replace the package's modules).
 (cd "$TREE" && PKG_SUFFIX="-lab-$CAND" DEB_REV=1 JOBS="$JOBS" ./build-kernel.sh)
