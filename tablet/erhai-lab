@@ -863,8 +863,15 @@ def check_probe_request(rung: str, alarm_s: int, has_pm_test: bool,
     if not has_pm_test:
         raise LabError("this kernel has no /sys/power/pm_test; boot a PM-debug lab kernel")
     if rung in REAL_SLEEP_RUNGS:
-        raise LabError(f"{rung} is a real-sleep rung; it needs the wave 1b "
-                       "classifier and ack (not in this build)")
+        # D26: one manual E5 before wave 1b, only with an RTC alarm (proven
+        # by E4.5) armed as the hook's last step; E6/E7 wait for the
+        # classifier and ack.
+        if rung != "E5":
+            raise LabError(f"{rung} is a real-sleep rung; it needs the wave 1b "
+                           "classifier and ack (not in this build)")
+        if alarm_s < 60:
+            raise LabError("E5 is a real sleep: give --alarm 60 or more "
+                           "(the RTC alarm is the timed way back)")
     if rung == "E4.5" and alarm_s <= 0:
         raise LabError("E4.5 proves the RTC alarm IRQ; give --alarm")
 
@@ -1031,6 +1038,9 @@ def cmd_probe(args: argparse.Namespace) -> int:
     for k in ("pm_wakeup_irq", "wakeup_diff", "panel_post", "root_ro", "restore_errors"):
         print(f"{k}: {ro.get(k)}")
     print(f"evidence: {STATE_DIR / attempt.bootid / str(int(attempt.ts))}/")
+    if attempt.pm_test == "none":
+        print("real sleep: did the screen and touch come back? Tell the lab "
+              "(the record stays pending until the screen is confirmed, D18).")
     return 0 if verdict == "pass" else 1
 
 

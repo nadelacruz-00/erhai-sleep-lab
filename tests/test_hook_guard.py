@@ -90,12 +90,18 @@ class JournalWrite(unittest.TestCase):
 
 
 class ProbeRefusals(unittest.TestCase):
-    def test_refuses_e0_and_real_sleep_in_wave_1a(self):
+    def test_refuses_e0_and_e6_e7_before_wave_1b(self):
         with self.assertRaisesRegex(lab.LabError, "manual rung"):
             lab.check_probe_request("E0", 0, True, "00-debug")
-        for rung in ("E5", "E6", "E7"):
+        for rung in ("E6", "E7"):
             with self.assertRaisesRegex(lab.LabError, "real-sleep"):
                 lab.check_probe_request(rung, 120, True, "00-debug")
+
+    def test_e5_only_with_an_alarm_of_60s_or_more(self):
+        for alarm in (0, 30, 59):
+            with self.assertRaisesRegex(lab.LabError, "--alarm 60"):
+                lab.check_probe_request("E5", alarm, True, "50-wlan-napi-kill-once")
+        lab.check_probe_request("E5", 120, True, "50-wlan-napi-kill-once")
 
     def test_refuses_without_pm_test_or_lab_kernel(self):
         with self.assertRaisesRegex(lab.LabError, "pm_test"):
