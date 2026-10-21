@@ -88,6 +88,22 @@ class VerifyAssets(unittest.TestCase):
             lab.parse_sums("not a checksum line\n")
 
 
+class ReleaseAssets(unittest.TestCase):
+    def test_picks_the_tagged_release(self):
+        releases = [
+            {"tag_name": "lab-00-debug-1", "assets": [{"name": "a", "browser_download_url": "u1"}]},
+            {"tag_name": "lab-00-debug-2", "assets": [
+                {"name": "x.efi", "browser_download_url": "u2"},
+                {"name": "SHA256SUMS", "browser_download_url": "u3"}]},
+        ]
+        self.assertEqual(lab.release_assets(releases, "lab-00-debug-2"),
+                         [("x.efi", "u2"), ("SHA256SUMS", "u3")])
+
+    def test_missing_release_refuses(self):
+        with self.assertRaisesRegex(lab.LabError, "not found"):
+            lab.release_assets([], "lab-00-debug-9")
+
+
 class LatestTag(unittest.TestCase):
     def test_highest_run_for_candidate(self):
         tags = ["lab-00-debug-3", "lab-00-debug-12", "lab-10-rails-always-on-40",

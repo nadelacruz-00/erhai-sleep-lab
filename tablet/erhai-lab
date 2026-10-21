@@ -217,15 +217,31 @@ def latest_tag(tags: list[str], candidate: str) -> str:
     return f"{prefix}{max(runs)}"
 
 
-def gh(*args: str) -> str:
+API = "https://api.github.com"
+
+
+def http_get(url: str, accept: str = "application/vnd.github+json") -> bytes:
+    """Anonymous HTTPS GET: the lab repo is public, and fetch runs as root,
+    which has no gh login."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, headers={"Accept": accept,
+                                               "User-Agent": "erhai-lab"})
     try:
-        out = subprocess.run(["gh", *args], check=True, text=True,
-                             capture_output=True)
-    except FileNotFoundError:
-        raise LabError("the GitHub CLI (gh) is not installed") from None
-    except subprocess.CalledProcessError as e:
-        raise LabError(f"gh {' '.join(args)} failed: {e.stderr.strip()}") from None
-    return out.stdout
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        raise LabError(f"GET {url}: HTTP {e.code} {e.reason}") from None
+    except urllib.error.URLError as e:
+        raise LabError(f"GET {url}: {e.reason}") from None
+
+
+def release_assets(releases: list[dict], tag: str) -> list[tuple[str, str]]:
+    """(name, download url) of every asset of the release tagged `tag`."""
+    for r in releases:
+        if r.get("tag_name") == tag:
+            return [(a["name"], a["browser_download_url"]) for a in r.get("assets", [])]
+    raise LabError(f"release {tag} not found")
 
 
 def install_assets(assets: Assets, boot_dir: Path = BOOT_DIR,
@@ -257,13 +273,16 @@ def install_assets(assets: Assets, boot_dir: Path = BOOT_DIR,
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
-    tags = [r["tagName"] for r in json.loads(
-        gh("release", "list", "-R", args.repo, "--limit", "200",
-           "--json", "tagName"))]
-    tag = args.tag or latest_tag(tags, args.candidate)
+    releases = json.loads(http_get(f"{API}/repos/{args.repo}/releases?per_page=100"))
+    tag = args.tag or latest_tag([r["tag_name"] for r in releases], args.candidate)
+    assets_list = release_assets(releases, tag)
     with tempfile.TemporaryDirectory(prefix="erhai-lab-fetch-") as tmp:
         d = Path(tmp)
-        gh("release", "download", tag, "-R", args.repo, "-D", str(d))
+        for name, url in assets_list:
+            if "/" in name or name.startswith("."):
+                raise LabError(f"refusing asset name {name!r}")
+            print(f"  downloading {name}")
+            (d / name).write_bytes(http_get(url, "application/octet-stream"))
         verify_assets(d)
         assets = identify_assets(d, args.candidate)
         print(f"{tag}: verified {assets.kver} ({len(parse_sums((d / 'SHA256SUMS').read_text()))} files)")
