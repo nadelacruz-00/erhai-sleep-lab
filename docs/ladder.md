@@ -211,3 +211,13 @@ is only a comparison run.
   on the third cycle after boot; without it, the WCN's own bus suspend works
   once and its MHI resume fails, after which every later suspend is refused
   or hangs.
+- **Candidate `50-wlan-napi-kill-once` (build 3), default Wi-Fi INI,
+  `erhai-lab wifi-cycle --count 5`: 5/5 clean** (1 idle shutdown, 1 idle
+  restart, 0 oopses, reconnected, per cycle). Its log shows the mechanism:
+  each idle restart registers 18 `dp_intr` ext groups; each idle shutdown
+  kills all 18 three times (`hif_exec_kill: 18 ext groups` twice, then the
+  deregister path), i.e. 36 `already killed, skipping` per cycle. On the
+  stock kernel every one of those repeat kills ran `netif_napi_del()` on a
+  napi whose dummy netdev the first kill had freed, taking
+  `netdev_lock(napi->dev)` on freed memory; the oops appeared once that
+  memory was reused (the third idle shutdown after boot, twice).
