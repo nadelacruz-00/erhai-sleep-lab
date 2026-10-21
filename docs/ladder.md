@@ -239,3 +239,19 @@ is only a comparison run.
   `pm8xxx_rtc_alarm`, `c400000.spmi:pmic@0:rtc@6100` wakeup events +2), with
   the same USB resume error. No-sleep rungs E1-E4.5 are complete on
   candidate 50.
+- **Candidate 50, E5 (first real sleep, s2idle, alarm 120 s, one manual run
+  per D26): the system slept and the RTC alarm woke it.** systemd-sleep
+  22:57:46 to 22:59:48; timekeeping suspended 119 s in total (17 s2idle
+  loop entries, longest 90.6 s); `pm_wakeup_irq: 220` (`pm8xxx_rtc_alarm`).
+  No oops. The screen came back, **touch did not**, and the USB resume error
+  is unchanged. Touch mechanism (from the saved dmesg): at suspend entry the
+  console switch enables the panel 1 s after `PM: suspend entry`, which
+  queues the NT36536 `resume_work`; the work downloads firmware while tasks
+  freeze, then polls the IC after the SPI controller has suspended
+  (`CTP_SPI_READ read error, ret=-108`, `nvt_check_fw_reset_state ...
+  retry=51`) and still marks the IC awake. The panel disable in between
+  skipped the touch sleep (the flag was not set yet), so after resume the
+  panel enable logged `Touch is already resume` and never re-initialised the
+  IC. Candidate `51-touch-suspend-sync` (= 50 + a touch patch) flushes
+  `resume_work` before the panel-off hook decides and puts the IC to sleep
+  in `nvt_pm_suspend`.
