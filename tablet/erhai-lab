@@ -1101,6 +1101,57 @@ def cmd_dryrun(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------------ wifi-cycle ---
+
+def cmd_wifi_cycle(args: argparse.Namespace) -> int:
+    """Sleep-free reproducer for the WLAN idle-shutdown oops (D25).
+
+    Each cycle turns the radio off (NetworkManager takes wlp1s0 down and the
+    WLAN idle shutdown follows after gInterfaceChangeWait), waits, turns it
+    back on (idle restart) and waits for a connection. On the stock kernel the
+    third idle shutdown after boot oopsed in hif_exec_napi_kill. Runs as a
+    transient system unit: Wi-Fi, and any session using it, drops during
+    the off phases. Results go to the lab journal and the unit's log.
+    """
+    require_root("wifi-cycle")
+    if os.environ.get("ERHAI_LAB_IN_UNIT") != "1":
+        tool = os.path.realpath(sys.argv[0])
+        r = subprocess.run(["systemd-run", "--unit=erhai-lab-wifi-cycle", "--collect",
+                            "--setenv=ERHAI_LAB_IN_UNIT=1", tool, "wifi-cycle",
+                            "--count", str(args.count), "--off", str(args.off)])
+        if r.returncode == 0:
+            print("started; Wi-Fi will drop. Afterwards: "
+                  "journalctl -u erhai-lab-wifi-cycle -o cat")
+        return r.returncode
+    base = f"erhai-lab wifi-cycle {int(time.time())}"
+    sysfs_write(Path("/dev/kmsg"), base, 5)
+    journal_write({"event": "wifi-cycle-start", "count": args.count,
+                   "kernelrelease": os.uname().release,
+                   "gInterfaceChangeWait": wlan_ini_value("gInterfaceChangeWait")})
+    for i in range(1, args.count + 1):
+        mark = f"{base} cycle {i}"
+        sysfs_write(Path("/dev/kmsg"), mark, 5)
+        os.sync()
+        run(["nmcli", "radio", "wifi", "off"], 15)
+        time.sleep(args.off)
+        run(["nmcli", "radio", "wifi", "on"], 15)
+        try:
+            wait_until(lambda: wlan_state() == "connected", 90, "Wi-Fi reconnect", 2.0)
+            connected = True
+        except StepFailed:
+            connected = False
+        kmsg = subprocess.run(["dmesg"], text=True, capture_output=True).stdout
+        ev = wlan_events_since(kmsg, mark)
+        line = (f"cycle {i}: idle shutdowns {ev['idle_shutdown']}, idle restarts "
+                f"{ev['idle_restart']}, oopses {ev['oops']}, reconnected {connected}")
+        print(line, flush=True)
+        journal_write({"event": "wifi-cycle", "cycle": i, "wlan": ev, "connected": connected})
+        if ev["oops"] or not connected:
+            print("stopping: oops or no reconnect", flush=True)
+            return 1
+    return 0
+
+
 # ----------------------------------------------------------------- check ---
 
 def e0_checks() -> list[tuple[str, bool, str]]:
@@ -1233,6 +1284,11 @@ def build_parser() -> argparse.ArgumentParser:
     dr.set_defaults(func=cmd_dryrun)
 
     sub.add_parser("check", help="E0 readiness checklist for the running kernel").set_defaults(func=cmd_check)
+
+    wc = sub.add_parser("wifi-cycle", help="sleep-free WLAN idle shutdown/restart reproducer")
+    wc.add_argument("--count", type=int, default=5)
+    wc.add_argument("--off", type=int, default=20, help="seconds the radio stays off")
+    wc.set_defaults(func=cmd_wifi_cycle)
 
     for name in ("boot", "ack"):
         q = sub.add_parser(name, help="(wave 1b, not in this build yet)")
