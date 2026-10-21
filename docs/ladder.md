@@ -221,3 +221,12 @@ is only a comparison run.
   napi whose dummy netdev the first kill had freed, taking
   `netdev_lock(napi->dev)` on freed memory; the oops appeared once that
   memory was reused (the third idle shutdown after boot, twice).
+- **Candidate 50, E2 x4 (devices): no freeze, no oops** (idle shutdown and
+  restart each run). Every run logs one resume error: `gcc_usb30_prim_master_clk
+  status stuck at 'off'` then `dwc3_qcom_pm_resume returns -16` (or -110);
+  the same USB error was present on the stock kernel. Next candidate area.
+- **Candidate 50, E4 (platform): all phases complete** (devices 36 ms, late
+  5 ms, noirq 8.5 ms; resume noirq 20 ms, early 2 ms, devices 44 ms), no oops,
+  only the USB resume error. `qcom-pcie 1c00000.pcie` `genpd_suspend_noirq`
+  took 0.98 ms with no `erhai-cc` lines: the host power-off path (b) does not
+  run in s2idle on this kernel (D3cold vetoed), as the design predicted.
