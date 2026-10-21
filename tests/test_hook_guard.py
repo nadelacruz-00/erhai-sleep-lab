@@ -166,6 +166,18 @@ class WlanEvents(unittest.TestCase):
                          {"idle_shutdown": 0, "idle_restart": 0, "oops": 0})
 
 
+class WlanIni(unittest.TestCase):
+    def test_reads_key_and_unset(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            ini = Path(tmp) / "WCNSS_qcom_cfg.ini"
+            ini.write_text("# c\ngEnableDebugLog=0\ngInterfaceChangeWait = 0\nEND\n")
+            self.assertEqual(lab.wlan_ini_value("gInterfaceChangeWait", ini), "0")
+            self.assertIsNone(lab.wlan_ini_value("gScanNumProbes", ini))
+            self.assertIsNone(lab.wlan_ini_value("x", Path(tmp) / "missing.ini"))
+
+
 class WakeupDiff(unittest.TestCase):
     def test_only_changed_sources(self):
         before = {"pwrkey": [0, 0], "rtc": [2, 2], "wlan": [4, 0]}

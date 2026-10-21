@@ -185,3 +185,15 @@ is only a comparison run.
   third crashed. Same crash as the L1 dry run (`cnss_pci` unbind). The lab
   hook's psoc-timer freeze runs inside `systemd-suspend.service`, after
   NetworkManager's teardown, so it cannot prevent this.
+- **Probe run with the qdf timers scaled (`timer_multiplier` 1000000 before
+  `systemctl suspend`): no effect.** Every run still did an idle shutdown
+  ~0.4 s after the probe started; `hdd_psoc_idle_timer_start()` passes
+  `gInterfaceChangeWait` straight to `qdf_delayed_work_start()`, unscaled.
+  Runs 1 and 2 passed; run 3 froze on the same oops (`hif_exec_napi_kill`,
+  address `000001a400000034`). On both boots that crashed, it was the **third
+  idle shutdown after boot**, with the same faulting address, so the crash
+  looks deterministic per power-off/power-on cycle. Each idle restart also
+  logged `notifier callback qcom_pcie_wcn_l1ss_notify already registered`.
+- Next (D24 step 2): `gInterfaceChangeWait=0` in
+  `/usr/lib/firmware/wlan/qca_cld/WCNSS_qcom_cfg.ini` disables the idle
+  shutdown (`hdd_psoc_idle_timer_start`: "psoc idle timer is disabled").
