@@ -821,6 +821,17 @@ PM_TEST = {"E1": "freezer", "E2": "devices", "E3": "devices", "E4": "platform",
            "E4.5": "platform", "E5": "none", "E6": "none", "E7": "none"}
 
 
+WIFI_REMOVAL_SUSPENDED = (
+    "Wi-Fi removal (L1/L2) is suspended: unbinding cnss_pci with wlan.ko "
+    "loaded oopsed in hif_exec_napi_kill on 2026-10-21 (docs/ladder.md); "
+    "pass --i-know-wifi-removal-oopses to run it anyway")
+
+
+def check_wifi_level(wifi: str, override: bool) -> None:
+    if wifi != "keep" and not override:
+        raise LabError(WIFI_REMOVAL_SUSPENDED)
+
+
 def check_probe_request(rung: str, alarm_s: int, has_pm_test: bool,
                         candidate: str) -> None:
     """Refusals that keep the ladder safe (D16, D21, office-hours R3-5)."""
@@ -869,9 +880,12 @@ def cmd_probe(args: argparse.Namespace) -> int:
                "--display", args.display, "--alarm", str(args.alarm)]
         if args.beacon:
             cmd.append("--beacon")
+        if args.i_know_wifi_removal_oopses:
+            cmd.append("--i-know-wifi-removal-oopses")
         return subprocess.run(cmd).returncode
 
     cand, build = lab_identity(read(Path("/proc/cmdline")))
+    check_wifi_level(args.wifi, args.i_know_wifi_removal_oopses)
     check_probe_request(args.rung, args.alarm, (POWER / "pm_test").exists(), cand)
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     import fcntl
@@ -948,6 +962,7 @@ def cmd_dryrun(args: argparse.Namespace) -> int:
     /sys/power/state. --fail-at injects a failure to prove the D7 guard.
     """
     require_root("dryrun")
+    check_wifi_level(args.wifi, args.i_know_wifi_removal_oopses)
     if args.fail_at and args.fail_at not in {s.name for s in pre_plan(
             Attempt(bootid="x", ts=0, rung="dry", wifi=args.wifi,
                     display=args.display, alarm_s=args.alarm))}:
@@ -1134,6 +1149,8 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--display", default="backlight", choices=DISPLAY_MODES)
     pr.add_argument("--alarm", type=int, default=0, help="RTC alarm seconds (0 = none)")
     pr.add_argument("--beacon", action="store_true")
+    pr.add_argument("--i-know-wifi-removal-oopses", action="store_true",
+                    help=argparse.SUPPRESS)
     pr.set_defaults(func=cmd_probe)
 
     dr = sub.add_parser("dryrun", help="real hook pre/post on this kernel, no sleep (step 2)")
@@ -1143,6 +1160,8 @@ def build_parser() -> argparse.ArgumentParser:
     dr.add_argument("--hold", type=int, default=10, help="seconds to stay torn down")
     dr.add_argument("--fail-at", help="inject a failure at this pre step (guard test)")
     dr.add_argument("--no-wait-wifi", action="store_true")
+    dr.add_argument("--i-know-wifi-removal-oopses", action="store_true",
+                    help=argparse.SUPPRESS)
     dr.set_defaults(func=cmd_dryrun)
 
     sub.add_parser("check", help="E0 readiness checklist for the running kernel").set_defaults(func=cmd_check)

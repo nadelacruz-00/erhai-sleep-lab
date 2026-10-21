@@ -115,6 +115,15 @@ class ProbeRefusals(unittest.TestCase):
         self.assertEqual(lab.PM_TEST["E4.5"], "platform")
 
 
+class WifiRemovalSuspended(unittest.TestCase):
+    def test_l1_l2_refused_without_override(self):
+        for level in ("L1", "L2"):
+            with self.assertRaisesRegex(lab.LabError, "hif_exec_napi_kill"):
+                lab.check_wifi_level(level, False)
+            lab.check_wifi_level(level, True)
+        lab.check_wifi_level("keep", False)
+
+
 class Verdict(unittest.TestCase):
     B = {"success": "3", "fail": "0"}
 

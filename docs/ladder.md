@@ -41,10 +41,24 @@ it never writes `/sys/power/state`. Run each, and check the printed result.
 |---|---|---|
 | D1 backlight, Wi-Fi kept | `sudo erhai-lab dryrun` | screen off then back on, `restore errors none` |
 | D2 GPU park + real blank | `sudo erhai-lab dryrun --display park` | GPU reaches `suspended`, screen blanks via the shell and returns, no restore errors |
-| D3 Wi-Fi L1 | `sudo erhai-lab dryrun --wifi L1` | Wi-Fi drops to `unavailable`, `cnss_pci` unbinds and rebinds, Wi-Fi reconnects; dmesg signature shows **no** `erhai-cc`/`pwrseq` lines |
+| ~~D3 Wi-Fi L1~~ **suspended** (see below) | `sudo erhai-lab dryrun --wifi L1` | Wi-Fi drops to `unavailable`, `cnss_pci` unbinds and rebinds, Wi-Fi reconnects; dmesg signature shows **no** `erhai-cc`/`pwrseq` lines |
 | D4 Wi-Fi L2 | `sudo erhai-lab dryrun --wifi L2` | exactly one pwrseq power-off on unbind and one clean `erhai-cc` bring-up on rebind, no SError/NoC lines, Wi-Fi reconnects |
 | D5 guard | `sudo erhai-lab dryrun --wifi L1 --fail-at wifi-unbind-l1` | `ABORTED at pre-wifi-unbind-l1`, completed steps undone in reverse, no undo errors |
 | D6 alarm readback | `sudo erhai-lab dryrun --alarm 30` | `alarm-arm` completes (readback within 3 s of the request) |
+
+**D3–D5 are suspended.** On 2026-10-21 the D3 run (`--wifi L1`, package
+kernel b28) unbound `cnss_pci` while `wlan.ko` was loaded and the kernel
+oopsed in the qcacld teardown, killing the writer: `Unable to handle kernel
+paging request at virtual address 00656c6261746394`, `pc :
+__mutex_lock.constprop.0`, call trace `hif_exec_napi_kill` ← `hif_exec_kill`
+← `hif_pci_disable_isr` ← `hif_ce_stop` ← `htc_stop` ← `cds_post_disable` ←
+`hdd_wlan_stop_modules` ← `hdd_wlan_exit` ← `wlan_hdd_pld_remove` ←
+`pld_pcie_remove` ← `cnss_pci_call_driver_remove` ← `cnss_pci_dev_shutdown` ←
+`cnss_pci_unregister_driver_hdlr` ← `cnss_pci_remove`. The same
+`hif_exec_napi_kill` crash is recorded in the dev's `erhai-suspend-gnome.sh`
+for a WLAN teardown racing suspend. Tearing the WCN host stack down on a live
+system crashes without any sleep, so L1 cannot be used as designed; the next
+step is a decision on how to remove Wi-Fi from the sleep path, if at all.
 
 For D3–D5 the dry run turns the Wi-Fi radio off itself, stays down at least
 30 s, and turns it back on at the end. Nothing is going to sleep, so
@@ -94,7 +108,7 @@ readouts under `/var/lib/erhai-sleep/<bootid>/<ts>/`.
 | Rung | pm_test | Command | Pass |
 |---|---|---|---|
 | E1 | freezer | `sudo erhai-lab probe --rung E1` | verdict `pass` |
-| E2 | devices | `sudo erhai-lab probe --rung E2 --wifi L1 --display park` (twice) | `pass` both times |
+| E2 | devices | `sudo erhai-lab probe --rung E2 --display park` (twice; Wi-Fi removal suspended) | `pass` both times |
 | E3 | devices | `sudo erhai-lab probe --rung E3 --display park` | `pass` |
 | E4 | platform | `sudo erhai-lab probe --rung E4 --display park` | `pass`; read the saved dmesg for `erhai-cc`/`pwrseq` lines: their presence means the host power-off path (b) runs |
 | E4u | platform | if E4 fails: `--wifi L1`, then `--wifi L2` | first level that passes |
