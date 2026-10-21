@@ -99,6 +99,18 @@ unexpected reset, check `mount | grep ' / '` is `rw` before going on.
 Abort everything if step 3 or 4 finds nothing: without pstore, failures
 cannot be attributed.
 
+**Result 2026-10-21 (package kernel b28): step 3 FAILED.** The pmsg marker did
+not survive a forced reset (power + volume up), and `/sys/fs/pstore` was empty
+after every boot that day, including clean `systemctl reboot`s and a boot that
+had logged an oops: `/sys/kernel/reboot/mode` is `cold` and the ramoops region
+at `0xa7800000` does not survive a cold reset on this firmware. A warm reboot
+(`echo warm > /sys/kernel/reboot/mode; reboot`) **hangs** after `systemd-shutdown`
+and needs a forced reset, so `reboot=warm` is not an option. Consequences until
+a persistent channel is found: E1-E4.5 can still run (CPUs never stop and each
+run saves dmesg to disk), but a hang or reset during a rung leaves only the
+fsynced journal entry naming the rung; real-sleep rungs stay blocked.
+
+
 ## E1–E4.5: pm_test rungs (lab kernel, no real sleep)
 
 `pm_test` makes the kernel walk the suspend path up to a level and come back
