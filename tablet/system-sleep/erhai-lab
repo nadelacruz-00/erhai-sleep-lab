@@ -1,0 +1,5 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# systemd-sleep caller. systemd-sleep only runs on a lab attempt (the lab
+# override exists only while armed); without a fresh attempt the tool is inert.
+exec /usr/local/sbin/erhai-lab hook "$@"

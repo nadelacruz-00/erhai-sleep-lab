@@ -12,7 +12,25 @@ One stdlib-only tool (eng review D4). Subcommands:
                       own suspend path runs untouched (D19)
   plan                print the hook step plan an attempt would run
   hook pre|post       called by systemd-sleep through the system-sleep caller
-  probe               run one lab attempt                 (next commit)
+  probe               run one lab attempt (pm_test rungs E1-E4.5 in wave 1a)
+  boot / ack          next-boot classifier and screen ack     (wave 1b)
+
+One attempt:
+
+  erhai-lab probe --rung E2 --wifi L1 --display park
+    re-exec as a transient system unit (outside user.slice)       D20
+    refuse: E0 / real-sleep rungs / no pm_test / not a lab kernel
+    write /run/erhai-lab/attempt.json, set pm_test, arm the override D19
+    systemctl suspend
+      NetworkManager tears Wi-Fi down on PrepareForSleep            D15
+      systemd-sleep -> hook pre, one ordered list, each step budgeted:
+        display park|off, watcher stop, psoc timer freeze,
+        [wifi settle, unbind L1 (, L2)], sync, journal, [alarm last]
+        any failure -> pm_test=freezer, undo in reverse, abort      D7
+      kernel: freeze -> devices -> (platform) -> back after pm_test_delay
+      systemd-sleep -> hook post: readouts, resume-ok, undo, panel,
+        evidence in /var/lib/erhai-sleep/<bootid>/<ts>/
+    wait for the post hook, disarm, restore pm_test, print verdict
 
 Records, rungs and classes are described in docs/ladder.md.
 """
@@ -42,7 +60,7 @@ ATTEMPT_FILE = RUN_DIR / "attempt.json"
 STATE_DIR = Path("/var/lib/erhai-sleep")
 ATTEMPT_MAX_AGE_S = 600
 
-RUNGS = ("E0", "E1", "E2", "E3", "E4", "E4.5", "E5", "E6", "E7")
+RUNGS = ("dry", "E0", "E1", "E2", "E3", "E4", "E4.5", "E5", "E6", "E7")
 WIFI_LEVELS = ("keep", "L1", "L2")
 DISPLAY_MODES = ("backlight", "park")
 REAL_SLEEP_RUNGS = ("E5", "E6", "E7")
@@ -389,6 +407,669 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------- hook: actions ---
+
+GPU_POWER = Path("/sys/devices/platform/soc@0/3d00000.gpu/power")
+DISPLAY_TOGGLE = "/usr/local/sbin/erhai-display-toggle.sh"
+WATCHER_UNIT = "erhai-power-toggle.service"
+TIMER_MULT = Path("/sys/module/wlan/parameters/timer_multiplier")
+TIMER_FROZEN = "1000000"
+WIFI_BDF = "0000:01:00.0"
+PCI_DEVICES = Path("/sys/bus/pci/devices")
+CNSS_DRIVER = Path("/sys/bus/pci/drivers/cnss_pci")
+PWRCTRL_DEV = "1c00000.pcie:pcie@0:wifi@0"
+PWRCTRL_DRIVER = Path("/sys/bus/platform/drivers/pci-pwrctrl-pwrseq")
+RTC = Path("/sys/class/rtc/rtc0")
+PMSG = Path("/dev/pmsg0")
+POWER = Path("/sys/power")
+BACKLIGHT = Path("/sys/class/backlight/ktz8868-backlight")
+DRM = Path("/sys/class/drm")
+QCOM_STATS = Path("/sys/kernel/debug/qcom_stats")
+HOOK_STATE = RUN_DIR / "hook.json"
+JOURNAL = STATE_DIR / "journal.jsonl"
+
+
+class StepFailed(Exception):
+    pass
+
+
+def read(path: Path, default: str = "") -> str:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return default
+
+
+def run(cmd: list[str], timeout: float) -> str:
+    try:
+        return subprocess.run(cmd, check=True, text=True, capture_output=True,
+                              timeout=timeout).stdout
+    except subprocess.TimeoutExpired:
+        raise StepFailed(f"{cmd[0]} timed out after {timeout:.0f} s") from None
+    except subprocess.CalledProcessError as e:
+        raise StepFailed(f"{' '.join(cmd)} exited {e.returncode}: "
+                         f"{(e.stderr or '').strip()[:200]}") from None
+
+
+def sysfs_write(path: Path, value: str, timeout: float) -> None:
+    """Write from a child process: a hung sysfs write cannot hang the hook."""
+    run(["sh", "-c", 'printf %s "$1" > "$2"', "sh", value, str(path)], timeout)
+
+
+def wait_until(pred, budget: float, what: str, interval: float = 0.5) -> None:
+    deadline = time.monotonic() + budget
+    while True:
+        if pred():
+            return
+        if time.monotonic() >= deadline:
+            raise StepFailed(f"{what} not reached within {budget:.0f} s")
+        time.sleep(interval)
+
+
+def session_user() -> tuple[str, int] | None:
+    """(name, uid) of the active graphical session of a real user."""
+    try:
+        out = subprocess.run(["loginctl", "list-sessions", "--no-legend"],
+                             text=True, capture_output=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in out.splitlines():
+        sid = line.split()[0] if line.split() else ""
+        if not sid:
+            continue
+        props = subprocess.run(["loginctl", "show-session", sid, "-p", "Active",
+                                "-p", "Type", "-p", "Name", "-p", "User"],
+                               text=True, capture_output=True, timeout=5).stdout
+        kv = dict(l.split("=", 1) for l in props.splitlines() if "=" in l)
+        if kv.get("Active") == "yes" and kv.get("Type") in ("wayland", "x11") \
+                and kv.get("User", "").isdigit() and int(kv["User"]) >= 1000:
+            return kv["Name"], int(kv["User"])
+    return None
+
+
+def screensaver_active(active: bool, timeout: float = 10) -> None:
+    """gnome-shell ScreenSaver.SetActive: the real DPU/DSI teardown (D13)."""
+    who = session_user()
+    if who is None:
+        raise StepFailed("no active graphical session for SetActive")
+    name, uid = who
+    rt = f"/run/user/{uid}"
+    run(["runuser", "-u", name, "--", "env", f"XDG_RUNTIME_DIR={rt}",
+         f"DBUS_SESSION_BUS_ADDRESS=unix:path={rt}/bus", "gdbus", "call",
+         "--session", "--dest", "org.gnome.Shell", "--object-path",
+         "/org/gnome/ScreenSaver", "--method", "org.gnome.ScreenSaver.SetActive",
+         "true" if active else "false"], timeout)
+
+
+def wlan_state() -> str:
+    out = run(["nmcli", "-t", "-f", "DEVICE,STATE", "dev"], 5)
+    for line in out.splitlines():
+        dev, _, state = line.partition(":")
+        if dev.startswith("wlp"):
+            return state
+    return "(no device)"
+
+
+def irq_counts(names: tuple[str, ...]) -> dict[str, int]:
+    """Total count per named IRQ; IRQ numbers change every boot."""
+    counts: dict[str, int] = {}
+    try:
+        lines = Path("/proc/interrupts").read_text().splitlines()
+    except OSError:
+        return counts
+    ncpu = len(lines[0].split()) if lines else 0
+    for line in lines[1:]:
+        parts = line.split()
+        if parts and parts[-1] in names:
+            counts[parts[-1]] = sum(int(x) for x in parts[1:1 + ncpu] if x.isdigit())
+    return counts
+
+
+def wakeup_snapshot() -> dict[str, list[int]]:
+    snap: dict[str, list[int]] = {}
+    for d in sorted(Path("/sys/class/wakeup").glob("wakeup*")):
+        name = read(d / "name")
+        try:
+            snap[name] = [int(read(d / "event_count", "0")),
+                          int(read(d / "wakeup_count", "0"))]
+        except ValueError:
+            continue
+    return snap
+
+
+def wakeup_diff(before: dict, after: dict) -> dict[str, list[int]]:
+    diff = {}
+    for name, (ev, wk) in after.items():
+        b = before.get(name, [0, 0])
+        if ev != b[0] or wk != b[1]:
+            diff[name] = [ev - b[0], wk - b[1]]
+    return diff
+
+
+def panel_state() -> dict[str, str]:
+    st = {"backlight": read(BACKLIGHT / "actual_brightness")}
+    for c in sorted(DRM.glob("card*-DSI-*")):
+        st[c.name] = f"{read(c / 'enabled')}/{read(c / 'dpms')}"
+    return st
+
+
+def suspend_stats() -> dict[str, str]:
+    d = POWER / "suspend_stats"
+    return {p.name: read(p) for p in sorted(d.iterdir())} if d.is_dir() else {}
+
+
+def qcom_stats() -> dict[str, str]:
+    if not QCOM_STATS.is_dir():
+        return {"absent": "debugfs qcom_stats not available"}
+    return {p.name: read(p)[:400] for p in sorted(QCOM_STATS.iterdir()) if p.is_file()}
+
+
+class HookActions:
+    """The system effect of each plan step and undo action.
+
+    Separate from the plan so the guard and undo logic can be tested with a
+    fake (tests/test_hook_guard.py) and the real effects in the on-tablet dry
+    run.
+    """
+
+    def __init__(self, attempt: Attempt, saved: dict):
+        self.a = attempt
+        self.saved = saved
+
+    def do(self, name: str, budget: float) -> None:
+        getattr(self, name.replace("-", "_"))(budget)
+
+    # display
+    def display_off(self, budget):
+        run([DISPLAY_TOGGLE, "off"], budget)
+
+    def display_on(self, budget):
+        run([DISPLAY_TOGGLE, "on"], budget)
+
+    def display_park(self, budget):
+        # The dev's survivable order: GPU parked first, then the real blank
+        # (erhai-panel-power.sh). Unlike that script, a GPU that does not
+        # park aborts the attempt instead of carrying on (D13).
+        self.saved["gpu_control"] = read(GPU_POWER / "control", "on")
+        sysfs_write(GPU_POWER / "control", "auto", 5)
+        wait_until(lambda: read(GPU_POWER / "runtime_status") == "suspended",
+                   budget, "GPU runtime park")
+        screensaver_active(True)
+        time.sleep(2)
+        run([DISPLAY_TOGGLE, "off"], 10)
+
+    def display_unpark(self, budget):
+        screensaver_active(False)
+        time.sleep(3)
+        run([DISPLAY_TOGGLE, "on"], 10)
+        sysfs_write(GPU_POWER / "control", self.saved.get("gpu_control", "on"), 5)
+
+    # power-button watcher: its fd must be closed so the wake press is not
+    # replayed as a new toggle after resume (harness STEP2b)
+    def watcher_stop(self, budget):
+        active = subprocess.run(["systemctl", "is-active", "--quiet", WATCHER_UNIT]).returncode == 0
+        self.saved["watcher_active"] = active
+        if active:
+            run(["systemctl", "stop", WATCHER_UNIT], budget)
+
+    def watcher_start(self, budget):
+        if self.saved.get("watcher_active"):
+            run(["systemctl", "start", WATCHER_UNIT], budget)
+
+    # WCN psoc idle-shutdown timer (harness STEP2d)
+    def psoc_timer_freeze(self, budget):
+        if not TIMER_MULT.exists():
+            self.saved["timer_multiplier"] = None
+            return
+        self.saved["timer_multiplier"] = read(TIMER_MULT)
+        sysfs_write(TIMER_MULT, TIMER_FROZEN, budget)
+
+    def psoc_timer_restore(self, budget):
+        orig = self.saved.get("timer_multiplier")
+        if orig is not None and TIMER_MULT.exists():
+            sysfs_write(TIMER_MULT, orig, budget)
+
+    # Wi-Fi: wait for NetworkManager's own PrepareForSleep teardown; never a
+    # second radio-off (D15)
+    def wifi_settle(self, budget):
+        wait_until(lambda: wlan_state() in ("unavailable", "unmanaged"),
+                   budget, "NetworkManager Wi-Fi teardown (unavailable|unmanaged)", 1.0)
+
+    def wifi_unbind_l1(self, budget):
+        if (CNSS_DRIVER / WIFI_BDF).exists():
+            sysfs_write(CNSS_DRIVER / "unbind", WIFI_BDF, budget)
+            self.saved["l1_unbound"] = True
+
+    def wifi_rebind_l1(self, budget):
+        if not self.saved.get("l1_unbound"):
+            return
+        if not (PCI_DEVICES / WIFI_BDF).exists():
+            sysfs_write(Path("/sys/bus/pci/rescan"), "1", budget)
+            wait_until(lambda: (PCI_DEVICES / WIFI_BDF).exists(), budget,
+                       f"PCI device {WIFI_BDF} after rescan")
+        if not (PCI_DEVICES / WIFI_BDF / "driver").exists():
+            sysfs_write(CNSS_DRIVER / "bind", WIFI_BDF, budget)
+
+    def wifi_unbind_l2(self, budget):
+        if (PWRCTRL_DRIVER / PWRCTRL_DEV).exists():
+            sysfs_write(PWRCTRL_DRIVER / "unbind", PWRCTRL_DEV, budget)
+            self.saved["l2_unbound"] = True
+
+    def wifi_rebind_l2(self, budget):
+        if self.saved.get("l2_unbound") and not (PWRCTRL_DRIVER / PWRCTRL_DEV).exists():
+            sysfs_write(PWRCTRL_DRIVER / "bind", PWRCTRL_DEV, budget)
+
+    # evidence
+    def sync(self, budget):
+        os.sync()
+        sysfs_write(Path("/proc/sysrq-trigger"), "s", budget)
+
+    def journal(self, budget):
+        journal_write({"event": "attempt", **dataclasses.asdict(self.a)})
+
+    # RTC alarm: armed last, readback checked (D16: a wake candidate, not a
+    # safety net; E4.5 proves its IRQ fires at all)
+    def alarm_arm(self, budget):
+        sysfs_write(RTC / "wakealarm", "0", budget)
+        base = int(read(RTC / "since_epoch", "0"))
+        sysfs_write(RTC / "wakealarm", f"+{self.a.alarm_s}", budget)
+        rb = read(RTC / "wakealarm")
+        if not rb.isdigit() or abs(int(rb) - (base + self.a.alarm_s)) > 3:
+            raise StepFailed(f"wakealarm readback {rb!r}, expected ~{base + self.a.alarm_s}")
+        self.saved["arm_ts"] = time.time()
+
+    def alarm_clear(self, budget):
+        sysfs_write(RTC / "wakealarm", "0", budget)
+
+
+def journal_write(entry: dict, pmsg: Path = PMSG, mirror: Path = JOURNAL) -> None:
+    """One JSON line to ramoops pmsg (survives a hard reset) and to the
+    fsynced mirror (the only channel if pmsg is missing)."""
+    entry = {"wall": time.time(), **entry}
+    line = json.dumps(entry, sort_keys=True) + "\n"
+    try:
+        with pmsg.open("w") as f:
+            f.write(line)
+    except OSError:
+        pass
+    mirror.parent.mkdir(parents=True, exist_ok=True)
+    with mirror.open("a") as f:
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def run_pre(attempt: Attempt, do, set_freezer, journal) -> dict:
+    """Run the pre plan under the D7 guard.
+
+    Any step that fails or overruns its budget turns the imminent sleep into
+    a freezer-only pm_test run, undoes the completed steps in reverse and
+    journals abort: pre-<step>. Returns the hook state for the post phase.
+    """
+    completed: list[Step] = []
+    state: dict = {"key": list(attempt.key), "completed": [], "aborted": None,
+                   "undo_errors": []}
+    for step in pre_plan(attempt):
+        try:
+            do(step.name, step.budget_s)
+        except Exception as e:  # noqa: BLE001 - every failure aborts the same way
+            state["aborted"] = f"pre-{step.name}"
+            state["abort_reason"] = str(e)
+            set_freezer()
+            for undo in undo_plan(completed):
+                try:
+                    do(undo, DEFAULT_BUDGET_S)
+                except Exception as ue:  # noqa: BLE001
+                    state["undo_errors"].append(f"{undo}: {ue}")
+            journal({"event": "abort", "step": state["aborted"],
+                     "reason": str(e), "key": list(attempt.key)})
+            break
+        completed.append(step)
+        state["completed"].append(step.name)
+    return state
+
+
+def set_freezer() -> None:
+    if (POWER / "pm_test").exists():
+        sysfs_write(POWER / "pm_test", "freezer", 5)
+
+
+def load_fresh_attempt() -> Attempt | None:
+    try:
+        a = Attempt.from_json(ATTEMPT_FILE.read_text())
+    except (OSError, ValueError, LabError):
+        return None
+    return a if a.is_fresh(current_bootid(), time.time()) else None
+
+
+def hook_pre() -> int:
+    attempt = load_fresh_attempt()
+    if attempt is None:
+        print("erhai-lab hook pre: no fresh attempt, inert")
+        return 0
+    saved: dict = {"wakeups": wakeup_snapshot(),
+                   "irqs": irq_counts(("pm8xxx_rtc_alarm", "pmic_pwrkey")),
+                   "stats": suspend_stats(), "panel_before": panel_state()}
+    actions = HookActions(attempt, saved)
+    state = run_pre(attempt, actions.do, set_freezer, journal_write)
+    state["saved"] = saved
+    state["pre_done"] = time.time()
+    HOOK_STATE.write_text(json.dumps(state, sort_keys=True))
+    print(f"erhai-lab hook pre: {state['aborted'] or 'ready'} "
+          f"({len(state['completed'])} steps)")
+    return 0
+
+
+def hook_post() -> int:
+    attempt = load_fresh_attempt()
+    try:
+        state = json.loads(HOOK_STATE.read_text())
+    except (OSError, ValueError):
+        state = None
+    if attempt is None or state is None or state.get("key") != list(attempt.key):
+        print("erhai-lab hook post: no matching attempt, inert")
+        return 0
+    saved = state["saved"]
+    actions = HookActions(attempt, saved)
+    readouts = {
+        "suspend_stats": suspend_stats(),
+        "pm_wakeup_irq": read(POWER / "pm_wakeup_irq"),
+        "wakeup_diff": wakeup_diff(saved["wakeups"], wakeup_snapshot()),
+        "irqs_after": irq_counts(("pm8xxx_rtc_alarm", "pmic_pwrkey")),
+        "qcom_stats": qcom_stats(),
+        "panel_pre": panel_state(),
+    }
+    journal_write({"event": "resume-ok", "key": list(attempt.key)})
+    root_ro = any(l.split()[1] == "/" and "ro" in l.split()[3].split(",")
+                  for l in Path("/proc/mounts").read_text().splitlines())
+    readouts["root_ro"] = root_ro
+    errors = []
+    if not state.get("aborted"):
+        done = [s for s in pre_plan(attempt) if s.name in state["completed"]]
+        for undo in undo_plan(done):
+            try:
+                actions.do(undo, DEFAULT_BUDGET_S)
+            except Exception as e:  # noqa: BLE001 - restore as much as possible
+                errors.append(f"{undo}: {e}")
+    time.sleep(3)
+    readouts["panel_post"] = panel_state()
+    readouts["restore_errors"] = errors
+    evdir = STATE_DIR / attempt.bootid / str(int(attempt.ts))
+    evdir.mkdir(parents=True, exist_ok=True)
+    (evdir / "dmesg.txt").write_text(subprocess.run(
+        ["dmesg"], text=True, capture_output=True).stdout)
+    (evdir / "readouts.json").write_text(json.dumps(readouts, indent=1, sort_keys=True))
+    if attempt.beacon:
+        journal_write({"event": "beacon-armed", "key": list(attempt.key)})
+        subprocess.run(["systemd-run", "--on-active=30", "--unit=erhai-lab-beacon",
+                        "--collect", "systemctl", "reboot"], check=False)
+    state.update(post_done=time.time(), readouts=readouts)
+    HOOK_STATE.write_text(json.dumps(state, sort_keys=True))
+    print(f"erhai-lab hook post: done ({len(errors)} restore errors)")
+    return 0
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    require_root("hook")
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    return hook_pre() if args.phase == "pre" else hook_post()
+
+
+# ----------------------------------------------------------------- probe ---
+
+PM_TEST = {"E1": "freezer", "E2": "devices", "E3": "devices", "E4": "platform",
+           "E4.5": "platform", "E5": "none", "E6": "none", "E7": "none"}
+
+
+def check_probe_request(rung: str, alarm_s: int, has_pm_test: bool,
+                        candidate: str) -> None:
+    """Refusals that keep the ladder safe (D16, D21, office-hours R3-5)."""
+    if rung == "dry":
+        raise LabError("use `erhai-lab dryrun` for the no-sleep dry run")
+    if rung == "E0":
+        raise LabError("E0 is a manual rung (see docs/ladder.md), not a probe run")
+    if not candidate:
+        raise LabError("not running a lab kernel (no erhai_lab.candidate on the cmdline)")
+    if not has_pm_test:
+        raise LabError("this kernel has no /sys/power/pm_test; boot a PM-debug lab kernel")
+    if rung in REAL_SLEEP_RUNGS:
+        raise LabError(f"{rung} is a real-sleep rung; it needs the wave 1b "
+                       "classifier and ack (not in this build)")
+    if rung == "E4.5" and alarm_s <= 0:
+        raise LabError("E4.5 proves the RTC alarm IRQ; give --alarm")
+
+
+def pm_test_verdict(rung: str, before: dict, after: dict, aborted: str | None,
+                    irq_before: dict, irq_after: dict) -> str:
+    if aborted:
+        return f"abort ({aborted})"
+    try:
+        ds = int(after.get("success", 0)) - int(before.get("success", 0))
+        df = int(after.get("fail", 0)) - int(before.get("fail", 0))
+    except ValueError:
+        return "unknown (suspend_stats unreadable)"
+    if df or ds != 1:
+        return (f"fail (success +{ds}, fail +{df}, step "
+                f"{after.get('last_failed_step', '?')}, dev {after.get('last_failed_dev', '?')})")
+    if rung == "E4.5":
+        a = irq_after.get("pm8xxx_rtc_alarm", 0) - irq_before.get("pm8xxx_rtc_alarm", 0)
+        return "pass" if a > 0 else "fail (RTC alarm IRQ did not fire)"
+    return "pass"
+
+
+def cmd_probe(args: argparse.Namespace) -> int:
+    require_root("probe")
+    if os.environ.get("ERHAI_LAB_IN_UNIT") != "1":
+        # Run outside the user's session scope so a session freeze or
+        # teardown cannot stop the probe mid-attempt (D20).
+        tool = os.path.realpath(sys.argv[0])
+        cmd = ["systemd-run", "--unit=erhai-lab-probe", "--collect", "--pipe",
+               "--wait", "--quiet", "--setenv=ERHAI_LAB_IN_UNIT=1", tool,
+               "probe", "--rung", args.rung, "--wifi", args.wifi,
+               "--display", args.display, "--alarm", str(args.alarm)]
+        if args.beacon:
+            cmd.append("--beacon")
+        return subprocess.run(cmd).returncode
+
+    cand, build = lab_identity(read(Path("/proc/cmdline")))
+    check_probe_request(args.rung, args.alarm, (POWER / "pm_test").exists(), cand)
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    import fcntl
+    lock = (RUN_DIR / "lock").open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise LabError("another erhai-lab attempt is running") from None
+
+    attempt = Attempt(bootid=current_bootid(), ts=time.time(), rung=args.rung,
+                      wifi=args.wifi, display=args.display, alarm_s=args.alarm,
+                      beacon=args.beacon, kernelrelease=os.uname().release,
+                      candidate=cand, build=build, pm_test=PM_TEST[args.rung],
+                      mem_sleep="s2idle")
+    HOOK_STATE.unlink(missing_ok=True)
+    ATTEMPT_FILE.write_text(attempt.to_json())
+    before = suspend_stats()
+    irq_before = irq_counts(("pm8xxx_rtc_alarm", "pmic_pwrkey"))
+    print(f"{attempt.rung}: pm_test={attempt.pm_test} wifi={attempt.wifi} "
+          f"display={attempt.display} alarm={attempt.alarm_s}s on {attempt.kernelrelease}")
+    print_times = read(POWER / "pm_print_times", "")
+    try:
+        if "[s2idle]" not in read(POWER / "mem_sleep"):
+            sysfs_write(POWER / "mem_sleep", "s2idle", 5)
+        if print_times:
+            sysfs_write(POWER / "pm_print_times", "1", 5)
+        sysfs_write(POWER / "pm_test", attempt.pm_test, 5)
+        arm()
+        subprocess.run(["systemctl", "suspend"], check=True)
+        wait_until(lambda: HOOK_STATE.exists() and "post_done" in read(HOOK_STATE),
+                   attempt.alarm_s + 120, "post hook completion", 1.0)
+        state = json.loads(HOOK_STATE.read_text())
+    finally:
+        disarm()
+        if (POWER / "pm_test").exists():
+            sysfs_write(POWER / "pm_test", "none", 5)
+        if print_times:
+            sysfs_write(POWER / "pm_print_times", print_times, 5)
+        ATTEMPT_FILE.unlink(missing_ok=True)
+    ro = state.get("readouts", {})
+    verdict = pm_test_verdict(attempt.rung, before, ro.get("suspend_stats", {}),
+                              state.get("aborted"), irq_before, ro.get("irqs_after", {}))
+    journal_write({"event": "result", "ok": True, "key": list(attempt.key),
+                   "verdict": verdict})
+    print(f"verdict: {verdict}")
+    if state.get("abort_reason"):
+        print(f"abort reason: {state['abort_reason']}")
+    for k in ("pm_wakeup_irq", "wakeup_diff", "panel_post", "root_ro", "restore_errors"):
+        print(f"{k}: {ro.get(k)}")
+    print(f"evidence: {STATE_DIR / attempt.bootid / str(int(attempt.ts))}/")
+    return 0 if verdict == "pass" else 1
+
+
+# ---------------------------------------------------------------- dryrun ---
+
+class FailingActions(HookActions):
+    """Real actions, except one step that fails on purpose (guard test)."""
+
+    def __init__(self, attempt, saved, fail_at):
+        super().__init__(attempt, saved)
+        self.fail_at = fail_at
+
+    def do(self, name, budget):
+        if name == self.fail_at:
+            raise StepFailed(f"injected failure at {name}")
+        super().do(name, budget)
+
+
+def cmd_dryrun(args: argparse.Namespace) -> int:
+    """Step-2 dry run: the real hook pre/post on this kernel, no sleep.
+
+    Exercises the display, watcher, timer and Wi-Fi steps and their undo with
+    the session live, exactly as an armed attempt would, but never writes
+    /sys/power/state. --fail-at injects a failure to prove the D7 guard.
+    """
+    require_root("dryrun")
+    if args.fail_at and args.fail_at not in {s.name for s in pre_plan(
+            Attempt(bootid="x", ts=0, rung="dry", wifi=args.wifi,
+                    display=args.display, alarm_s=args.alarm))}:
+        raise LabError(f"--fail-at {args.fail_at} is not a step of this plan")
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    attempt = Attempt(bootid=current_bootid(), ts=time.time(), rung="dry",
+                      wifi=args.wifi, display=args.display, alarm_s=args.alarm,
+                      kernelrelease=os.uname().release)
+    # A pwrctrl rebind runs the WCN cold bring-up, which the dev has seen
+    # reset the SoC: make sure a reset here is attributable and the root is
+    # synced first (office-hours R3-6).
+    os.sync()
+    sysfs_write(Path("/proc/sysrq-trigger"), "s", 10)
+    journal_write({"event": "dryrun-start", **dataclasses.asdict(attempt)})
+    ATTEMPT_FILE.write_text(attempt.to_json())
+    HOOK_STATE.unlink(missing_ok=True)
+    dmesg_mark = f"erhai-lab dryrun {int(attempt.ts)}"
+    sysfs_write(Path("/dev/kmsg"), dmesg_mark, 5)
+
+    saved: dict = {"wakeups": wakeup_snapshot(), "irqs": {}, "stats": {},
+                   "panel_before": panel_state()}
+    actions = (FailingActions(attempt, saved, args.fail_at) if args.fail_at
+               else HookActions(attempt, saved))
+    noop_freezer = lambda: print("  (guard: would set pm_test=freezer)")  # noqa: E731
+    hold = args.hold
+    if args.wifi != "keep":
+        # No PrepareForSleep in a dry run, so NetworkManager is not touching
+        # the chip: one radio-off here stands in for its teardown (the dev
+        # harness's standalone QUIESCE=1 path). Never in a real attempt (D15).
+        # Off->on within seconds wedged the WCN in the dev's DRY runs, so
+        # stay down at least 30 s.
+        hold = max(hold, 30)
+        run(["nmcli", "radio", "wifi", "off"], 15)
+    state = run_pre(attempt, actions.do, noop_freezer, journal_write)
+    print(f"pre: completed {state['completed']}")
+    if state["aborted"]:
+        print(f"pre: ABORTED at {state['aborted']}: {state.get('abort_reason')}")
+        print(f"pre: undo errors: {state['undo_errors'] or 'none'}")
+    print(f"pre: wlan={wlan_state()} panel={panel_state()} "
+          f"gpu={read(GPU_POWER / 'runtime_status')}")
+    if not state["aborted"]:
+        print(f"holding {hold} s with everything torn down ...")
+        time.sleep(hold)
+        state["saved"] = saved
+        state["pre_done"] = time.time()
+        HOOK_STATE.write_text(json.dumps(state, sort_keys=True))
+        hook_post()
+        post = json.loads(HOOK_STATE.read_text())
+        print(f"post: restore errors {post['readouts']['restore_errors'] or 'none'}")
+        print(f"post: panel {post['readouts']['panel_post']}")
+    ATTEMPT_FILE.unlink(missing_ok=True)
+    if args.wifi != "keep":
+        if state["aborted"]:
+            time.sleep(max(0, 30 - (time.time() - attempt.ts)))
+        run(["nmcli", "radio", "wifi", "on"], 15)
+        if not args.no_wait_wifi:
+            wait_until(lambda: wlan_state() == "connected", 90, "Wi-Fi reconnect", 2.0)
+            print("Wi-Fi reconnected")
+    kmsg = subprocess.run(["dmesg"], text=True, capture_output=True).stdout
+    tail = kmsg[kmsg.rfind(dmesg_mark):] if dmesg_mark in kmsg else ""
+    sig = [l for l in tail.splitlines()
+           if re.search(r"erhai-cc|pwrseq|WLAN_EN|SError|NoC|cnss: .*(power|link)", l)]
+    print(f"dmesg signature since start ({len(sig)} lines):")
+    for l in sig[-40:]:
+        print("  " + l)
+    journal_write({"event": "dryrun-end", "key": list(attempt.key),
+                   "aborted": state["aborted"]})
+    return 0
+
+
+# ----------------------------------------------------------------- check ---
+
+def e0_checks() -> list[tuple[str, bool, str]]:
+    """Readiness for the ladder on the running kernel (E0, step 2)."""
+    res: list[tuple[str, bool, str]] = []
+    cand, build = lab_identity(read(Path("/proc/cmdline")))
+    res.append(("lab kernel", bool(cand), f"{os.uname().release} candidate={cand or '-'} build={build or '-'}"))
+    res.append(("pm_test", (POWER / "pm_test").exists(), read(POWER / "pm_test", "absent")))
+    res.append(("pm_debug_messages", (POWER / "pm_debug_messages").exists(),
+                read(POWER / "pm_debug_messages", "absent")))
+    try:
+        cfg = subprocess.run(["sh", "-c", "zcat /proc/config.gz"], text=True,
+                             capture_output=True, timeout=10).stdout
+    except subprocess.TimeoutExpired:
+        cfg = ""
+    wd = "CONFIG_DPM_WATCHDOG=y" in cfg.splitlines()
+    res.append(("DPM watchdog", wd, "CONFIG_DPM_WATCHDOG=y" if wd else "not in /proc/config.gz"))
+    res.append(("mem_sleep s2idle", "[s2idle]" in read(POWER / "mem_sleep"), read(POWER / "mem_sleep")))
+    res.append(("pmsg", PMSG.exists(), str(PMSG)))
+    res.append(("rtc0 alarm", (RTC / "wakealarm").exists(),
+                f"{read(RTC / 'name')} since_epoch={read(RTC / 'since_epoch')}"))
+    res.append(("pwrkey wake source", any("pwrkey" in read(w / "name") for w in
+                                          Path("/sys/class/wakeup").glob("wakeup*")), ""))
+    res.append(("persistent journald", Path("/var/log/journal").is_dir(), "/var/log/journal"))
+    res.append(("qcom_stats", QCOM_STATS.is_dir(), str(QCOM_STATS)))
+    res.append(("GPU runtime PM", (GPU_POWER / "runtime_status").exists(),
+                f"{read(GPU_POWER / 'control')}/{read(GPU_POWER / 'runtime_status')}"))
+    res.append(("cnss_pci bound", (CNSS_DRIVER / WIFI_BDF).exists(), WIFI_BDF))
+    res.append(("pwrctrl bound", (PWRCTRL_DRIVER / PWRCTRL_DEV).exists(), PWRCTRL_DEV))
+    res.append(("session for SetActive", session_user() is not None, str(session_user())))
+    pkg = subprocess.run(["dpkg-query", "-W", "-f", "${Version}", "oneplus-erhai-linux-7.3"],
+                         text=True, capture_output=True).stdout.strip()
+    rev = pkg.rsplit("+b", 1)[-1] if "+b" in pkg else ""
+    ukis = sorted(p.name for p in BOOT_DIR.glob("*.efi"))
+    revert = next((u for u in ukis if u.endswith(f"-b{rev}.efi")), "")
+    res.append(("revert UKI = package's", bool(revert), f"package {pkg} -> {revert or '?'}; all: {ukis}"))
+    held = "oneplus-erhai-linux-7.3" in subprocess.run(
+        ["apt-mark", "showhold"], text=True, capture_output=True).stdout
+    res.append(("kernel package held (D17)", held, "apt-mark hold oneplus-erhai-linux-7.3"))
+    res.append(("lab override not armed", not (DROPIN_DIR / DROPIN_NAME).exists(),
+                str(DROPIN_DIR / DROPIN_NAME)))
+    return res
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    ok_all = True
+    for name, ok, detail in e0_checks():
+        ok_all &= ok
+        print(f"[{'ok' if ok else '--'}] {name:<26} {detail}")
+    return 0 if ok_all else 1
+
+
 # ---------------------------------------------------------------- ladder ---
 
 def e5_level(e4_kept_passed: bool,
@@ -442,8 +1123,32 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--beacon", action="store_true")
     pl.set_defaults(func=cmd_plan)
 
-    for name in ("hook", "probe", "boot", "ack"):
-        q = sub.add_parser(name, help="(not implemented in this build yet)")
+    h = sub.add_parser("hook", help="systemd-sleep hook (called by the system-sleep caller)")
+    h.add_argument("phase", choices=("pre", "post"))
+    h.add_argument("action", nargs="?", default="suspend")
+    h.set_defaults(func=cmd_hook)
+
+    pr = sub.add_parser("probe", help="run one lab attempt (pm_test rungs E1-E4.5)")
+    pr.add_argument("--rung", required=True, choices=RUNGS)
+    pr.add_argument("--wifi", default="keep", choices=WIFI_LEVELS)
+    pr.add_argument("--display", default="backlight", choices=DISPLAY_MODES)
+    pr.add_argument("--alarm", type=int, default=0, help="RTC alarm seconds (0 = none)")
+    pr.add_argument("--beacon", action="store_true")
+    pr.set_defaults(func=cmd_probe)
+
+    dr = sub.add_parser("dryrun", help="real hook pre/post on this kernel, no sleep (step 2)")
+    dr.add_argument("--wifi", default="keep", choices=WIFI_LEVELS)
+    dr.add_argument("--display", default="backlight", choices=DISPLAY_MODES)
+    dr.add_argument("--alarm", type=int, default=0)
+    dr.add_argument("--hold", type=int, default=10, help="seconds to stay torn down")
+    dr.add_argument("--fail-at", help="inject a failure at this pre step (guard test)")
+    dr.add_argument("--no-wait-wifi", action="store_true")
+    dr.set_defaults(func=cmd_dryrun)
+
+    sub.add_parser("check", help="E0 readiness checklist for the running kernel").set_defaults(func=cmd_check)
+
+    for name in ("boot", "ack"):
+        q = sub.add_parser(name, help="(wave 1b, not in this build yet)")
         q.add_argument("rest", nargs="*")
         q.set_defaults(func=cmd_not_yet)
     return p

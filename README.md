@@ -35,14 +35,14 @@ dark). Candidate fixes are then tested one CI-built kernel at a time.
   an attempt is armed (`erhai-lab arm` / `disarm`); otherwise the port's own
   suspend path runs untouched.
 - Real-sleep rungs run only on a PM-debug kernel and only after the no-sleep
-  rungs pass. The protocol is in `docs/ladder.md` (in progress).
+  rungs pass. The protocol is in `docs/ladder.md`.
 
 ## Status
 
-Wave 1a in progress: CI and the `00-debug` candidate (PM debug, DPM watchdog,
+Wave 1a: CI and the `00-debug` candidate (PM debug, DPM watchdog,
 `mem_sleep_default=s2idle`, `pm_debug_messages`, `no_console_suspend`);
-`erhai-lab fetch`, `arm`, `disarm`, `plan`. The hook, probe, harvester and
-classifier follow.
+`erhai-lab fetch`, `arm`, `disarm`, `plan`, `hook`, `probe` (pm_test rungs),
+`dryrun`, `check`. The next-boot classifier, beacon and `ack` (wave 1b) follow.
 
 ## Tests
 
