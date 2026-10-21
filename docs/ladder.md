@@ -159,3 +159,29 @@ is only a comparison run.
 | E | no `resume-ok`, no panic; silent reset during suspend entry (last console line before the s2idle loop) |
 | A | no `resume-ok`, no panic; ended by the user's forced reset, power + volume up (wake never arrived) |
 | abort | the attempt never entered sleep (guard fired or `suspend_stats.fail` moved) |
+
+## Results log
+
+**2026-10-21, lab kernel `00-debug` build 2**
+
+- E1 pass (freezer). E2 pass once (devices, `--display park`): every driver
+  suspended and resumed in ~40 ms; `dwc3_qcom_pm_resume returned -110` (USB
+  controller resume timeout) logged but not counted as a failure;
+  `cnss_pci` `pci_pm_suspend` returned after 4 µs, so the WCN's real suspend
+  is not in the devices phase.
+- In both passes the panel came back on ~1 s after `PM: suspend entry`
+  (`nvt_ts_panel_power_on`), before tasks were frozen; the failed run logged
+  `detected fb_set_par error, error code: -16` at the same point. Lead: the
+  console (VT) switch at suspend entry makes DRM restore the display,
+  undoing the GPU park + blank.
+- **E2 second run: the tablet froze at suspend entry.** Cause, from the
+  persistent journal of that boot: on `PrepareForSleep` NetworkManager took
+  `wlp1s0` down, ~0.4 s later cnss ran the WLAN **idle shutdown**
+  (`cnss: Doing idle shutdown`, qcacld `gInterfaceChangeWait` default 250 ms),
+  and the idle shutdown oopsed in `hif_exec_napi_kill` (`kworker` in
+  `cnss_driver_event_work` died holding a mutex, `exited with preempt_count 1`).
+  The suspend entry 12 s later hung. Every attempt that day ran an idle
+  shutdown before sleep and an idle restart after it; 2 of 3 completed, the
+  third crashed. Same crash as the L1 dry run (`cnss_pci` unbind). The lab
+  hook's psoc-timer freeze runs inside `systemd-suspend.service`, after
+  NetworkManager's teardown, so it cannot prevent this.
