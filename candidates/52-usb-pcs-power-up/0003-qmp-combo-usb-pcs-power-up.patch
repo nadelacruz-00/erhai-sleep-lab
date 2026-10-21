@@ -1,0 +1,28 @@
+From: erhai-sleep-lab
+Subject: [PATCH] phy: qcom: qmp-combo: power the USB PCS up in usb_power_on
+
+usb_power_off() clears SW_PWRDN in PCS_POWER_DOWN_CONTROL, and only
+com_init() sets it again. The erhai keep-alive in usb_exit leaves the
+common block initialised, so on the next usb_init com_init() returns
+early, the PCS stays powered down, and the PHYSTATUS poll times out:
+"phy initialization timed-out", dwc3_qcom_pm_resume returns -110 on
+every system resume, and USB stays dead until reboot. Set SW_PWRDN at
+the start of usb_power_on, which is a no-op after a full com_init.
+---
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -4256,6 +4256,14 @@
+ 	unsigned int val;
+ 	int ret;
+ 
++	/*
++	 * erhai: usb_power_off() powers the PCS down, but with the common
++	 * block kept alive (see usb_exit) com_init() returns early and never
++	 * powers it back up, so PHYSTATUS never clears on the next init
++	 * (-110 on every system resume). Power the PCS up as com_init() does.
++	 */
++	qphy_setbits(pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL], SW_PWRDN);
++
+ 	qmp_configure(qmp->dev, serdes, cfg->serdes_tbl, cfg->serdes_tbl_num);
+ 
+ 	/* Tx, Rx, and PCS configurations */

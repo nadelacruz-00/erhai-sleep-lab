@@ -273,3 +273,15 @@ is only a comparison run.
   finish (`nvt_ts_resume end` at 445.715171, `display off: sleeping NT36536`
   at 445.715260) and slept the IC on live rails, so the panel enable after
   resume ran a full re-init (firmware download, pen command acked).
+- **USB resume error, root cause (code read, 2026-10-21).** In every saved
+  run the first suspend of a boot fails the same way: `qmp_combo_usb_init`
+  on resume logs `com_init ... count=1` (the erhai keep-alive left the
+  common block up), then `phy initialization timed-out`, and
+  `dwc3_qcom_pm_resume` returns -110. `usb_power_off()` clears `SW_PWRDN` in
+  `PCS_POWER_DOWN_CONTROL` and only `com_init()` sets it again, which the
+  keep-alive skips, so the PCS stays powered down. The
+  `gcc_usb30_prim_master_clk status stuck at 'off'` / -16 variant only
+  appears on later suspends of a boot whose USB already failed (secondary).
+  It is not power loss: E2 (no noirq, no domain power-off) fails
+  identically. Candidate `52-usb-pcs-power-up` (= 51 + a qmp-combo patch)
+  sets `SW_PWRDN` at the start of `qmp_combo_usb_power_on`.

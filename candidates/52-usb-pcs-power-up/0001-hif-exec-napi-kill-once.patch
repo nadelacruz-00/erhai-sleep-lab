@@ -1,0 +1,49 @@
+From: erhai-sleep-lab
+Subject: [PATCH] qca-wifi-host-cmn: hif: make the napi exec kill idempotent
+
+A second hif_exec_napi_kill() on the same context locked the freed dummy
+netdev through netif_napi_del()/netdev_lock(napi->dev) and oopsed during
+the WLAN idle shutdown. Return early when the context was already killed,
+and log ext-group registrations and kills to see the lifecycle.
+---
+--- a/drivers/staging/qca-wifi-host-cmn/hif/src/hif_exec.c
++++ b/drivers/staging/qca-wifi-host-cmn/hif/src/hif_exec.c
+@@ -911,6 +911,20 @@
+ 	struct hif_napi_exec_context *n_ctx = hif_exec_get_napi(ctx);
+ 	int irq_ind;
+ 
++	/*
++	 * erhai: a second kill of the same context must be a no-op. The first
++	 * kill deletes the napi and frees its dummy netdev, but napi.dev still
++	 * points at the freed netdev, and on this kernel netif_napi_del() and
++	 * napi_disable() take netdev_lock(napi->dev): a second kill locks
++	 * freed memory (Oops in __mutex_lock from hif_exec_napi_kill during
++	 * the WLAN idle shutdown, on the third idle shutdown after boot).
++	 */
++	if (!n_ctx->netdev) {
++		pr_info("erhai: hif napi grp %d already killed, skipping\n",
++			ctx->grp_id);
++		return;
++	}
++
+ 	if (ctx->inited) {
+ 		qdf_napi_disable(&n_ctx->napi);
+ 		ctx->inited = 0;
+@@ -1192,6 +1206,8 @@
+ 	int i;
+ 	struct HIF_CE_state *hif_state = HIF_GET_CE_STATE(hif_ctx);
+ 
++	pr_info("erhai: hif_exec_kill: %d ext groups\n",
++		hif_state->hif_num_extgroup);
+ 	for (i = 0; i < hif_state->hif_num_extgroup; i++)
+ 		hif_state->hif_ext_group[i]->sched_ops->kill(
+ 			hif_state->hif_ext_group[i]);
+@@ -1270,6 +1286,8 @@
+ 	hif_init_force_napi_complete(hif_ext_group);
+ 
+ 	hif_state->hif_num_extgroup++;
++	pr_info("erhai: hif_register_ext_group %s -> grp %d (now %d)\n",
++		context_name, hif_ext_group->grp_id, hif_state->hif_num_extgroup);
+ 	return QDF_STATUS_SUCCESS;
+ }
+ qdf_export_symbol(hif_register_ext_group);
