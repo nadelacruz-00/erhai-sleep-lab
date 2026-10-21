@@ -9,7 +9,7 @@ and `ack`, and `erhai-lab probe` refuses them until then.
 
 ## Safety contract
 
-- **Revert path:** a forced restart (hold power), then pick the **package
+- **Revert path:** a forced restart (hold **power + volume up**; power alone does not reset this tablet), then pick the **package
   kernel** in the rEFInd menu: the `.efi` whose `-b<N>` matches
   `dpkg-query -W oneplus-erhai-linux-7.3` (b28 on 2026-10-21; b27 also sits
   in `/boot` but runs with b28's modules, do not use it). `erhai-lab check`
@@ -78,11 +78,11 @@ unexpected reset, check `mount | grep ' / '` is `rw` before going on.
        # reboot, pick 7.3.0-rc5-sm8750-themojoman-lab-00-debug in rEFInd
 
 2. `sudo erhai-lab check`: every line `[ok]` except possibly `qcom_stats`.
-3. pmsg survives a **long-press** reset (covers the A/C/D/E endings):
+3. pmsg survives a **forced reset** (power + volume up) (covers the A/C/D/E endings):
 
        echo "erhai-lab E0 marker $(date +%s)" | sudo tee /dev/pmsg0
        sync; echo s | sudo tee /proc/sysrq-trigger
-       # hold power until the tablet resets, boot the lab kernel again
+       # hold power + volume up until the tablet resets, boot the lab kernel again
        sudo cat /sys/fs/pstore/pmsg-ramoops-0 2>/dev/null || sudo ls /var/lib/systemd/pstore/
 
    Pass: the marker line is there.
@@ -145,5 +145,5 @@ is only a comparison run.
 | B | no `resume-ok`; pstore holds a DPM-watchdog panic or an oops naming a device |
 | C | no `resume-ok`, no panic; silent reset during resume |
 | E | no `resume-ok`, no panic; silent reset during suspend entry (last console line before the s2idle loop) |
-| A | no `resume-ok`, no panic; ended by the user's long press (wake never arrived) |
+| A | no `resume-ok`, no panic; ended by the user's forced reset, power + volume up (wake never arrived) |
 | abort | the attempt never entered sleep (guard fired or `suspend_stats.fail` moved) |
