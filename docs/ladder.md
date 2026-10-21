@@ -197,3 +197,17 @@ is only a comparison run.
 - Next (D24 step 2): `gInterfaceChangeWait=0` in
   `/usr/lib/firmware/wlan/qca_cld/WCNSS_qcom_cfg.ini` disables the idle
   shutdown (`hdd_psoc_idle_timer_start`: "psoc idle timer is disabled").
+- **E2 with `gInterfaceChangeWait=0` (idle shutdown disabled): the idle
+  shutdown is gone** (`hdd_psoc_idle_timer_start: psoc idle timer is
+  disabled`, 0 idle shutdowns in every run), **but the powered-up WCN does
+  not survive the devices phase.** Run 1: `cnss: Failed to set MHI state:
+  RESUME(7), err = -22`, `cnss_pci 0000:01:00.0: PM: pci_pm_resume returned
+  -11 after 3652840 usecs` (the probe printed `pass`: resume errors were not
+  counted; fixed). Runs 2-3: `__wlan_hdd_bus_suspend: Failed pmo bus suspend:
+  8`, `cnss: Failed to suspend host driver, err = -16`, suspend aborted.
+  Run 4 froze inside the devices phase, last line `wiphy_suspend` on `phy0`.
+- Conclusion: both Wi-Fi paths into sleep fail on this kernel. With the idle
+  shutdown, the WCN is powered off before sleep and the power-off crashes
+  on the third cycle after boot; without it, the WCN's own bus suspend works
+  once and its MHI resume fails, after which every later suspend is refused
+  or hangs.

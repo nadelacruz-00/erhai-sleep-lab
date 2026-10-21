@@ -881,6 +881,15 @@ def pm_test_verdict(rung: str, before: dict, after: dict, aborted: str | None,
     if df or ds != 1:
         return (f"fail (success +{ds}, fail +{df}, step "
                 f"{after.get('last_failed_step', '?')}, dev {after.get('last_failed_dev', '?')})")
+    # A device that fails to *resume* bumps failed_resume* but not fail, and
+    # the cycle still counts as a success: a pass must not hide it.
+    resume_fail = {k: int(after.get(k, 0)) - int(before.get(k, 0))
+                   for k in ("failed_resume", "failed_resume_early", "failed_resume_noirq")
+                   if str(after.get(k, "0")).isdigit() and str(before.get(k, "0")).isdigit()}
+    bad = {k: v for k, v in resume_fail.items() if v}
+    if bad:
+        return (f"fail (resume errors {bad}, last dev "
+                f"{after.get('last_failed_dev', '?')})")
     if rung == "E4.5":
         a = irq_after.get("pm8xxx_rtc_alarm", 0) - irq_before.get("pm8xxx_rtc_alarm", 0)
         return "pass" if a > 0 else "fail (RTC alarm IRQ did not fire)"

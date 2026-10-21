@@ -142,6 +142,14 @@ class Verdict(unittest.TestCase):
         self.assertIn("cnss_pci", v)
         self.assertTrue(v.startswith("fail"))
 
+    def test_resume_error_is_not_a_pass(self):
+        before = {"success": "3", "fail": "0", "failed_resume": "0"}
+        after = {"success": "4", "fail": "0", "failed_resume": "1",
+                 "last_failed_dev": "0000:01:00.0"}
+        v = lab.pm_test_verdict("E2", before, after, None, {}, {})
+        self.assertTrue(v.startswith("fail (resume errors"), v)
+        self.assertIn("0000:01:00.0", v)
+
     def test_e4_5_requires_alarm_irq(self):
         after = {"success": "4", "fail": "0"}
         self.assertTrue(lab.pm_test_verdict("E4.5", self.B, after, None,
