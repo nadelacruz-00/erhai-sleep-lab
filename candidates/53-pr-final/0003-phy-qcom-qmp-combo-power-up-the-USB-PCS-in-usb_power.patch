@@ -1,0 +1,59 @@
+From 6eb98e5df53db712fd817748c883b581c5cf2498 Mon Sep 17 00:00:00 2001
+From: nadelacruz-00 <323917690+nadelacruz-00@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:27:33 +0800
+Subject: [PATCH 3/3] phy: qcom: qmp-combo: power up the USB PCS in
+ usb_power_on()
+
+USB fails to resume after every system suspend and stays dead until
+reboot:
+
+  qcom-qmp-combo-phy 88e8000.phy: erhai qmp: com_init force=0 count=1 ...
+  qcom-qmp-combo-phy 88e8000.phy: phy initialization timed-out
+  phy phy-88e8000.phy.2: phy init failed --> -110
+  dwc3-qcom a600000.usb: PM: dwc3_qcom_pm_resume returns -110
+
+qmp_combo_usb_power_off() clears SW_PWRDN in PCS_POWER_DOWN_CONTROL,
+which powers the PCS down. Only qmp_combo_com_init() sets the bit
+again. The keep-alive in qmp_combo_usb_exit() leaves the common block
+initialised, so on the next qmp_combo_usb_init() com_init() returns
+early on init_count. The PCS stays powered down, PHYSTATUS never clears
+and the poll times out. Power loss is not the cause: a pm_test=devices
+cycle, which never powers the domains off, fails the same way.
+
+Set SW_PWRDN at the start of qmp_combo_usb_power_on(), as com_init()
+does. After a full com_init() the bit is already set, so the write
+changes nothing.
+
+Tested on a OnePlus Pad 3 (SM8750). With the change, a pm_test=devices
+cycle and a 120 s s2idle suspend both resume dwc3 without errors, device
+mode comes back, and a USB 3 drive plugged in after resume enumerates at
+SuperSpeed Plus. Without it, every resume fails with -110.
+
+Fixes: 9d83ca978fe6 ("erhai revive: qmp force recover behind erhai_qmp_force param (default off)")
+Assisted-by: LLM
+---
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index a7cb6d3fe..16764ccbf 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -4256,6 +4256,14 @@ static int qmp_combo_usb_power_on(struct phy *phy)
+ 	unsigned int val;
+ 	int ret;
+ 
++	/*
++	 * erhai: usb_power_off() powers the PCS down, but with the common
++	 * block kept alive (see usb_exit) com_init() returns early and never
++	 * powers it back up, so PHYSTATUS never clears on the next init
++	 * (-110 on every system resume). Power the PCS up as com_init() does.
++	 */
++	qphy_setbits(pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL], SW_PWRDN);
++
+ 	qmp_configure(qmp->dev, serdes, cfg->serdes_tbl, cfg->serdes_tbl_num);
+ 
+ 	/* Tx, Rx, and PCS configurations */
+-- 
+2.53.0
+

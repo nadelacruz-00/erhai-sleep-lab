@@ -1,0 +1,98 @@
+From 7a5b2f91101d52e5fc15a1d5f79b7ea4178ff9fa Mon Sep 17 00:00:00 2001
+From: nadelacruz-00 <323917690+nadelacruz-00@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:27:23 +0800
+Subject: [PATCH 2/3] Input: nt36xxx - keep the touch IC state in sync across
+ system suspend
+
+After an s2idle suspend and resume the screen comes back but touch stays
+dead until the panel is power cycled again.
+
+At suspend entry the console switch enables the panel, so
+nvt_ts_panel_power_on() queues resume_work about 1 s after "PM: suspend
+entry". The work downloads the firmware while tasks freeze. The panel
+is then disabled again, and nvt_ts_panel_power_off() returns early
+because bTouchIsAwake is not set yet. The work keeps polling the IC
+after the SPI controller has suspended, and still sets bTouchIsAwake:
+
+  [NVT-ts-spi] nvt_ts_panel_power_on: display on: resuming NT36536
+  geni_spi a90000.spi: PM: platform_pm_suspend returned 0
+  [NVT-ts-spi] CTP_SPI_READ: read error, ret=-108
+  [NVT-ts-spi] nvt_check_fw_reset_state: error, retry=51
+  [NVT-ts-spi] nvt_ts_resume: end
+  ...
+  PM: suspend exit
+  [NVT-ts-spi] nvt_ts_panel_power_on: display on: resuming NT36536
+  [NVT-ts-spi] nvt_ts_resume: Touch is already resume
+
+So the panel enable after resume skips the re-init, and the IC is left
+without firmware.
+
+Flush resume_work in nvt_ts_panel_power_off() before checking
+bTouchIsAwake, so an in-flight resume finishes while the rails are
+still up and the IC is then put to sleep. Also flush the queued work in
+nvt_pm_suspend(), while the SPI bus is still up, and put the IC to sleep
+if it is still awake. This covers a panel that stays enabled through
+suspend. In both cases the panel enable after resume runs a full
+re-init.
+
+Tested on a OnePlus Pad 3 (SM8750) with a 120 s s2idle suspend woken by
+the RTC alarm. The panel-off hook now waits for the in-flight resume
+and sleeps the IC, and touch works after resume. Without the change
+touch is dead after every such suspend.
+
+Fixes: 48a9e29f76c1 ("drm/panel/xn242: erhai: sleep/re-init the in-cell NT36536 with panel power")
+Assisted-by: LLM
+---
+ drivers/input/touchscreen/nt36523/nt36xxx.c | 27 ++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/input/touchscreen/nt36523/nt36xxx.c b/drivers/input/touchscreen/nt36523/nt36xxx.c
+index 17a3f5a15..18dd2af51 100644
+--- a/drivers/input/touchscreen/nt36523/nt36xxx.c
++++ b/drivers/input/touchscreen/nt36523/nt36xxx.c
+@@ -1767,9 +1767,21 @@ static void nvt_resume_work(struct work_struct *work)
+  */
+ void nvt_ts_panel_power_off(void)
+ {
+-	if (!ts || !bTouchIsAwake)
++	if (!ts)
+ 		return;
+ 
++	/*
++	 * A resume_work still in flight has not set bTouchIsAwake yet; let it
++	 * finish on live rails, or it completes after they drop and leaves the
++	 * IC marked awake, so the next panel enable skips re-init.
++	 */
++	if (ts->event_wq)
++		flush_work(&ts->resume_work);
++	if (!bTouchIsAwake) {
++		NVT_LOG("display off: NT36536 already asleep\n");
++		return;
++	}
++
+ 	NVT_LOG("display off: sleeping NT36536 before panel rail drop\n");
+ 	nvt_ts_suspend(&ts->client->dev);
+ }
+@@ -2450,6 +2462,19 @@ static int nvt_drm_notifier_callback(struct notifier_block *self, unsigned long
+ 
+ static int nvt_pm_suspend(struct device *dev)
+ {
++	/*
++	 * erhai: a panel enable during suspend entry (console switch) queues
++	 * resume_work, which then races the SPI controller's suspend
++	 * (-ESHUTDOWN). Finish queued work while the bus is still up, then put
++	 * the IC to sleep so the panel enable after resume re-inits it.
++	 */
++	flush_work(&ts->resume_work);
++	flush_work(&ts->suspend_work);
++	if (bTouchIsAwake && !ts->db_wakeup) {
++		NVT_LOG("system suspend: sleeping NT36536\n");
++		nvt_ts_suspend(dev);
++	}
++
+ 	if (device_may_wakeup(dev) && ts->db_wakeup) {
+ 		NVT_LOG("enable touch irq wake\n");
+ 		enable_irq_wake(ts->client->irq);
+-- 
+2.53.0
+
