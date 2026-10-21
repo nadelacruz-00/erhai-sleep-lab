@@ -124,7 +124,7 @@ readouts under `/var/lib/erhai-sleep/<bootid>/<ts>/`.
 | E3 | devices | `sudo erhai-lab probe --rung E3 --display park` | `pass` |
 | E4 | platform | `sudo erhai-lab probe --rung E4 --display park` | `pass`; read the saved dmesg for `erhai-cc`/`pwrseq` lines: their presence means the host power-off path (b) runs |
 | E4u | platform | if E4 fails: `--wifi L1`, then `--wifi L2` | first level that passes |
-| E4.5 | platform | `sudo erhai-lab probe --rung E4.5 --display park --alarm 30` | `pass` = the RTC alarm IRQ fired |
+| E4.5 | platform | `sudo erhai-lab probe --rung E4.5 --display park --alarm 30` (holds pm_test for alarm + 10 s) | `rtc alarm irq: +1` and `pm_wakeup_irq` naming the alarm |
 
 What each level exercises (from `kernel/power/suspend.c`):
 
@@ -230,3 +230,6 @@ is only a comparison run.
   only the USB resume error. `qcom-pcie 1c00000.pcie` `genpd_suspend_noirq`
   took 0.98 ms with no `erhai-cc` lines: the host power-off path (b) does not
   run in s2idle on this kernel (D3cold vetoed), as the design predicted.
+- E4.5 first run (2026-10-21) was **invalid**: `pm_test_delay` is 5 s, so the
+  system resumed after 5 s and the post hook cleared the 30 s alarm before it
+  could fire. The probe now raises `pm_test_delay` to alarm + 10 s for the run.

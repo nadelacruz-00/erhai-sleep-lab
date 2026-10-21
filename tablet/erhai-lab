@@ -869,6 +869,17 @@ def check_probe_request(rung: str, alarm_s: int, has_pm_test: bool,
         raise LabError("E4.5 proves the RTC alarm IRQ; give --alarm")
 
 
+PM_TEST_DELAY = Path("/sys/module/suspend/parameters/pm_test_delay")
+
+
+def pm_test_hold(pm_test: str, alarm_s: int) -> int | None:
+    """Seconds pm_test must hold the suspended state so an armed alarm can
+    fire inside it; None when nothing needs changing."""
+    if pm_test == "none" or alarm_s <= 0:
+        return None
+    return alarm_s + 10
+
+
 def pm_test_verdict(rung: str, before: dict, after: dict, aborted: str | None,
                     irq_before: dict, irq_after: dict) -> str:
     if aborted:
@@ -970,7 +981,14 @@ def cmd_probe(args: argparse.Namespace) -> int:
     marker = f"erhai-lab probe {int(attempt.ts)}"
     sysfs_write(Path("/dev/kmsg"), marker, 5)
     print_times = read(POWER / "pm_print_times", "")
+    # pm_test holds the suspended state for pm_test_delay seconds (default
+    # 5). An alarm armed for longer would be cleared by the post hook before
+    # it could fire, so stretch the hold past the alarm.
+    delay_orig = read(PM_TEST_DELAY) if PM_TEST_DELAY.exists() else ""
+    hold = pm_test_hold(attempt.pm_test, attempt.alarm_s)
     try:
+        if hold and delay_orig:
+            sysfs_write(PM_TEST_DELAY, str(hold), 5)
         if "[s2idle]" not in read(POWER / "mem_sleep"):
             sysfs_write(POWER / "mem_sleep", "s2idle", 5)
         if print_times:
@@ -979,7 +997,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
         arm()
         subprocess.run(["systemctl", "suspend"], check=True)
         wait_until(lambda: HOOK_STATE.exists() and "post_done" in read(HOOK_STATE),
-                   attempt.alarm_s + 120, "post hook completion", 1.0)
+                   attempt.alarm_s + (hold or 0) + 120, "post hook completion", 1.0)
         state = json.loads(HOOK_STATE.read_text())
     finally:
         disarm()
@@ -987,6 +1005,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
             sysfs_write(POWER / "pm_test", "none", 5)
         if print_times:
             sysfs_write(POWER / "pm_print_times", print_times, 5)
+        if hold and delay_orig:
+            sysfs_write(PM_TEST_DELAY, delay_orig, 5)
         ATTEMPT_FILE.unlink(missing_ok=True)
     ro = state.get("readouts", {})
     verdict = pm_test_verdict(attempt.rung, before, ro.get("suspend_stats", {}),
@@ -1004,7 +1024,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
         # first and would hide whether the alarm fired.
         fired = (ro.get("irqs_after", {}).get("pm8xxx_rtc_alarm", 0)
                  - irq_before.get("pm8xxx_rtc_alarm", 0))
-        print(f"rtc alarm irq: +{fired} ({'fired' if fired > 0 else 'did NOT fire'})")
+        print(f"rtc alarm irq: +{fired} ({'fired' if fired > 0 else 'did NOT fire'}); "
+              f"held {hold or read(PM_TEST_DELAY, '?')} s")
     if state.get("abort_reason"):
         print(f"abort reason: {state['abort_reason']}")
     for k in ("pm_wakeup_irq", "wakeup_diff", "panel_post", "root_ro", "restore_errors"):

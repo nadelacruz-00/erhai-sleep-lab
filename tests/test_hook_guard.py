@@ -124,6 +124,15 @@ class WifiRemovalSuspended(unittest.TestCase):
         lab.check_wifi_level("keep", False)
 
 
+class PmTestHold(unittest.TestCase):
+    def test_hold_outlasts_the_alarm(self):
+        self.assertEqual(lab.pm_test_hold("platform", 30), 40)
+
+    def test_no_change_without_alarm_or_for_real_sleep(self):
+        self.assertIsNone(lab.pm_test_hold("platform", 0))
+        self.assertIsNone(lab.pm_test_hold("none", 120))
+
+
 class Verdict(unittest.TestCase):
     B = {"success": "3", "fail": "0"}
 
