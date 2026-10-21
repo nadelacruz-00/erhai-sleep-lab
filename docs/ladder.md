@@ -261,3 +261,15 @@ is only a comparison run.
   /usr/local/sbin/erhai-panel-power.sh off`, then `... on`, ran
   `nvt_ts_suspend` and then a full `nvt_ts_resume` (firmware download, no
   reset-state error, pen command accepted) and touch came back.
+- **Candidate 51, E2: touch fine** (the panel-off hook slept the IC; full
+  re-init on resume); USB resume error only. **E5 (alarm 120 s): the system
+  slept and the RTC alarm woke it, screen and touch both came back**
+  (confirmed by the user). One s2idle entry of 119.0 s (candidate 50's E5
+  needed 17 entries), `pm_wakeup_irq` = `pm8xxx_rtc_alarm` (IRQ 235 this
+  boot; the number changes between boots), no oops, Wi-Fi idle
+  shutdown/restart clean, USB resume error only. The fix path ran as
+  designed: the console switch again enabled the panel 1 s after suspend
+  entry and queued `resume_work`; the panel-off hook now waited for it to
+  finish (`nvt_ts_resume end` at 445.715171, `display off: sleeping NT36536`
+  at 445.715260) and slept the IC on live rails, so the panel enable after
+  resume ran a full re-init (firmware download, pen command acked).
