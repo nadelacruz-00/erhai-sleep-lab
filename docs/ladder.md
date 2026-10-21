@@ -255,3 +255,9 @@ is only a comparison run.
   IC. Candidate `51-touch-suspend-sync` (= 50 + a touch patch) flushes
   `resume_work` before the panel-off hook decides and puts the IC to sleep
   in `nvt_pm_suspend`.
+  Recovery confirmed the mechanism: the power button only switches the
+  backlight (the panel stays enabled, so touch is not re-initialised), but a
+  real panel cycle, `sudo ERHAI_SESSION_USER=<you>
+  /usr/local/sbin/erhai-panel-power.sh off`, then `... on`, ran
+  `nvt_ts_suspend` and then a full `nvt_ts_resume` (firmware download, no
+  reset-state error, pen command accepted) and touch came back.
