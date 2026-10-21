@@ -887,6 +887,15 @@ def pm_test_verdict(rung: str, before: dict, after: dict, aborted: str | None,
     return "pass"
 
 
+def wlan_events_since(kmsg: str, marker: str) -> dict[str, int]:
+    """Count WLAN idle shutdowns/restarts and oopses after the probe marker."""
+    i = kmsg.rfind(marker)
+    tail = kmsg[i:] if i >= 0 else ""
+    return {"idle_shutdown": tail.count("cnss: Doing idle shutdown"),
+            "idle_restart": tail.count("cnss: Doing idle restart"),
+            "oops": len(re.findall(r"Internal error: Oops", tail))}
+
+
 def cmd_probe(args: argparse.Namespace) -> int:
     require_root("probe")
     if os.environ.get("ERHAI_LAB_IN_UNIT") != "1":
@@ -901,6 +910,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
             cmd.append("--beacon")
         if args.i_know_wifi_removal_oopses:
             cmd.append("--i-know-wifi-removal-oopses")
+        if args.no_idle_freeze:
+            cmd.append("--no-idle-freeze")
         return subprocess.run(cmd).returncode
 
     cand, build = lab_identity(read(Path("/proc/cmdline")))
@@ -923,10 +934,22 @@ def cmd_probe(args: argparse.Namespace) -> int:
     ATTEMPT_FILE.write_text(attempt.to_json())
     before = suspend_stats()
     irq_before = irq_counts(("pm8xxx_rtc_alarm", "pmic_pwrkey"))
+    freeze_idle = not args.no_idle_freeze
     print(f"{attempt.rung}: pm_test={attempt.pm_test} wifi={attempt.wifi} "
-          f"display={attempt.display} alarm={attempt.alarm_s}s on {attempt.kernelrelease}")
+          f"display={attempt.display} alarm={attempt.alarm_s}s "
+          f"idle-freeze={'on' if freeze_idle else 'off'} on {attempt.kernelrelease}")
+    marker = f"erhai-lab probe {int(attempt.ts)}"
+    sysfs_write(Path("/dev/kmsg"), marker, 5)
     print_times = read(POWER / "pm_print_times", "")
+    timer_orig = read(TIMER_MULT) if TIMER_MULT.exists() else None
     try:
+        if freeze_idle and timer_orig is not None:
+            # NetworkManager takes Wi-Fi down on PrepareForSleep, before
+            # systemd-suspend.service (and the hook) even starts, and the
+            # WLAN idle shutdown it schedules (gInterfaceChangeWait, 250 ms)
+            # has crashed in hif_exec_napi_kill (docs/ladder.md, results
+            # log). Scale the qdf timers up before that happens (D24).
+            sysfs_write(TIMER_MULT, TIMER_FROZEN, 5)
         if "[s2idle]" not in read(POWER / "mem_sleep"):
             sysfs_write(POWER / "mem_sleep", "s2idle", 5)
         if print_times:
@@ -943,13 +966,19 @@ def cmd_probe(args: argparse.Namespace) -> int:
             sysfs_write(POWER / "pm_test", "none", 5)
         if print_times:
             sysfs_write(POWER / "pm_print_times", print_times, 5)
+        if freeze_idle and timer_orig is not None and TIMER_MULT.exists():
+            sysfs_write(TIMER_MULT, timer_orig, 5)
         ATTEMPT_FILE.unlink(missing_ok=True)
     ro = state.get("readouts", {})
     verdict = pm_test_verdict(attempt.rung, before, ro.get("suspend_stats", {}),
                               state.get("aborted"), irq_before, ro.get("irqs_after", {}))
+    kmsg = subprocess.run(["dmesg"], text=True, capture_output=True).stdout
+    wlan = wlan_events_since(kmsg, marker)
     journal_write({"event": "result", "ok": True, "key": list(attempt.key),
-                   "verdict": verdict})
+                   "verdict": verdict, "idle_freeze": freeze_idle, "wlan": wlan})
     print(f"verdict: {verdict}")
+    print(f"wlan: idle shutdowns {wlan['idle_shutdown']}, idle restarts "
+          f"{wlan['idle_restart']}, oopses {wlan['oops']}")
     if state.get("abort_reason"):
         print(f"abort reason: {state['abort_reason']}")
     for k in ("pm_wakeup_irq", "wakeup_diff", "panel_post", "root_ro", "restore_errors"):
@@ -1170,6 +1199,9 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--beacon", action="store_true")
     pr.add_argument("--i-know-wifi-removal-oopses", action="store_true",
                     help=argparse.SUPPRESS)
+    pr.add_argument("--no-idle-freeze", action="store_true",
+                    help="do not scale the WLAN qdf timers before suspending "
+                         "(to test the gInterfaceChangeWait INI on its own)")
     pr.set_defaults(func=cmd_probe)
 
     dr = sub.add_parser("dryrun", help="real hook pre/post on this kernel, no sleep (step 2)")

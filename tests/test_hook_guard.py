@@ -152,6 +152,20 @@ class Verdict(unittest.TestCase):
                                              {"pm8xxx_rtc_alarm": 3}), "pass")
 
 
+class WlanEvents(unittest.TestCase):
+    LOG = ("[1] cnss: Doing idle shutdown\n[2] erhai-lab probe 100\n"
+           "[3] cnss: Doing idle shutdown\n[4] Internal error: Oops: 96000004 [#1]\n"
+           "[5] cnss: Doing idle restart\n")
+
+    def test_counts_only_after_the_marker(self):
+        self.assertEqual(lab.wlan_events_since(self.LOG, "erhai-lab probe 100"),
+                         {"idle_shutdown": 1, "idle_restart": 1, "oops": 1})
+
+    def test_missing_marker_counts_nothing(self):
+        self.assertEqual(lab.wlan_events_since(self.LOG, "erhai-lab probe 999"),
+                         {"idle_shutdown": 0, "idle_restart": 0, "oops": 0})
+
+
 class WakeupDiff(unittest.TestCase):
     def test_only_changed_sources(self):
         before = {"pwrkey": [0, 0], "rtc": [2, 2], "wlan": [4, 0]}
