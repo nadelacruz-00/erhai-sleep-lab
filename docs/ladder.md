@@ -285,3 +285,17 @@ is only a comparison run.
   It is not power loss: E2 (no noirq, no domain power-off) fails
   identically. Candidate `52-usb-pcs-power-up` (= 51 + a qmp-combo patch)
   sets `SW_PWRDN` at the start of `qmp_combo_usb_power_on`.
+- **Candidate 52, E2: first clean `pass`** (no resume errors at all):
+  `com_init ... count=1` again took the keep-alive path, but the PHY now
+  reported ready and `dwc3_qcom_pm_resume` returned 0; gadget mode back.
+  **E5 (alarm 120 s): `pass`**, one s2idle entry of 118.5 s, woken by
+  `pm8xxx_rtc_alarm` (IRQ 232 this boot), screen, touch and USB came back
+  (user-confirmed), Wi-Fi idle shutdown/restart clean, no oops. Open from
+  this run: a Samsung T7 SSD left plugged in (USB host mode) through the
+  sleep did not survive it: `xhci-hcd: WARNING: Host System Error`,
+  `usb_dev_resume` took 2.65 s, then `USB disconnect` and a failed cache
+  sync on `sdg`; a replug re-enumerated it at SuperSpeed Plus. Until that is
+  fixed, eject USB storage before sleeping. The
+  `notifier callback qcom_pcie_wcn_l1ss_notify already registered` warning
+  after resume comes from every WLAN idle restart (also at 9 s, 32 s and
+  128 s of this boot), not from sleep.
