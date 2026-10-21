@@ -346,6 +346,7 @@ class Step:
 DEFAULT_BUDGET_S = 15.0
 WIFI_SETTLE_S = 12.0   # the dev harness's STEP2c window
 GPU_PARK_S = 15.0
+WLAN_RELOAD_S = 60.0   # modprobe wlan: cnss2 powers the WCN up and boots its FW
 
 
 def pre_plan(attempt: Attempt | None) -> list[Step]:
@@ -412,7 +413,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
 GPU_POWER = Path("/sys/devices/platform/soc@0/3d00000.gpu/power")
 DISPLAY_TOGGLE = "/usr/local/sbin/erhai-display-toggle.sh"
 WATCHER_UNIT = "erhai-power-toggle.service"
-TIMER_MULT = Path("/sys/module/wlan/parameters/timer_multiplier")
+WLAN_MODULE = "wlan"
+WLAN_MODULE_DIR = Path("/sys/module") / WLAN_MODULE
+TIMER_MULT = WLAN_MODULE_DIR / "parameters" / "timer_multiplier"
 TIMER_FROZEN = "1000000"
 WIFI_BDF = "0000:01:00.0"
 PCI_DEVICES = Path("/sys/bus/pci/devices")
@@ -632,6 +635,12 @@ class HookActions:
     # Wi-Fi: wait for NetworkManager's own PrepareForSleep teardown; never a
     # second radio-off (D15)
     def wifi_settle(self, budget):
+        if wlan_state() == "(no device)":
+            # Nothing to tear down: the host driver is not loaded, typically
+            # after an earlier cnss_pci rebind without a wlan.ko reload.
+            raise StepFailed("no Wi-Fi device in NetworkManager; the WLAN host "
+                             f"driver is not loaded (rmmod {WLAN_MODULE}; "
+                             f"modprobe {WLAN_MODULE}, or reboot)")
         wait_until(lambda: wlan_state() in ("unavailable", "unmanaged"),
                    budget, "NetworkManager Wi-Fi teardown (unavailable|unmanaged)", 1.0)
 
@@ -649,6 +658,16 @@ class HookActions:
                        f"PCI device {WIFI_BDF} after rescan")
         if not (PCI_DEVICES / WIFI_BDF / "driver").exists():
             sysfs_write(CNSS_DRIVER / "bind", WIFI_BDF, budget)
+        # cnss_pci_remove() unregisters the qcacld host driver
+        # (cnss_pci_unregister_driver_hdlr), but cnss_pci_probe() never probes
+        # it again: the chip stays powered off with no netdev until wlan.ko
+        # registers anew. rmmod, not modprobe -r, which would also unload the
+        # then-unused cnss2 (a cnss2 reload has reset the SoC).
+        if WLAN_MODULE_DIR.exists():
+            run(["rmmod", WLAN_MODULE], budget)
+        run(["modprobe", WLAN_MODULE], WLAN_RELOAD_S)
+        wait_until(lambda: wlan_state() != "(no device)", budget,
+                   "Wi-Fi device after wlan.ko reload", 1.0)
 
     def wifi_unbind_l2(self, budget):
         if (PWRCTRL_DRIVER / PWRCTRL_DEV).exists():
@@ -902,7 +921,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
         arm()
         subprocess.run(["systemctl", "suspend"], check=True)
         wait_until(lambda: HOOK_STATE.exists() and "post_done" in read(HOOK_STATE),
-                   attempt.alarm_s + 120, "post hook completion", 1.0)
+                   attempt.alarm_s + 120 + WLAN_RELOAD_S, "post hook completion", 1.0)
         state = json.loads(HOOK_STATE.read_text())
     finally:
         disarm()
@@ -999,13 +1018,19 @@ def cmd_dryrun(args: argparse.Namespace) -> int:
         print(f"post: restore errors {post['readouts']['restore_errors'] or 'none'}")
         print(f"post: panel {post['readouts']['panel_post']}")
     ATTEMPT_FILE.unlink(missing_ok=True)
+    reconnect_error = None
     if args.wifi != "keep":
         if state["aborted"]:
             time.sleep(max(0, 30 - (time.time() - attempt.ts)))
         run(["nmcli", "radio", "wifi", "on"], 15)
         if not args.no_wait_wifi:
-            wait_until(lambda: wlan_state() == "connected", 90, "Wi-Fi reconnect", 2.0)
-            print("Wi-Fi reconnected")
+            try:
+                wait_until(lambda: wlan_state() == "connected", 90, "Wi-Fi reconnect", 2.0)
+                print("Wi-Fi reconnected")
+            except StepFailed as e:
+                # Still print the dmesg signature: it is the evidence.
+                reconnect_error = str(e)
+                print(f"Wi-Fi did NOT reconnect: {e} (wlan={wlan_state()})")
     kmsg = subprocess.run(["dmesg"], text=True, capture_output=True).stdout
     tail = kmsg[kmsg.rfind(dmesg_mark):] if dmesg_mark in kmsg else ""
     sig = [l for l in tail.splitlines()
@@ -1014,8 +1039,8 @@ def cmd_dryrun(args: argparse.Namespace) -> int:
     for l in sig[-40:]:
         print("  " + l)
     journal_write({"event": "dryrun-end", "key": list(attempt.key),
-                   "aborted": state["aborted"]})
-    return 0
+                   "aborted": state["aborted"], "reconnect_error": reconnect_error})
+    return 1 if reconnect_error else 0
 
 
 # ----------------------------------------------------------------- check ---

@@ -41,7 +41,7 @@ it never writes `/sys/power/state`. Run each, and check the printed result.
 |---|---|---|
 | D1 backlight, Wi-Fi kept | `sudo erhai-lab dryrun` | screen off then back on, `restore errors none` |
 | D2 GPU park + real blank | `sudo erhai-lab dryrun --display park` | GPU reaches `suspended`, screen blanks via the shell and returns, no restore errors |
-| D3 Wi-Fi L1 | `sudo erhai-lab dryrun --wifi L1` | Wi-Fi drops to `unavailable`, `cnss_pci` unbinds and rebinds, Wi-Fi reconnects; dmesg signature shows **no** `erhai-cc`/`pwrseq` lines |
+| D3 Wi-Fi L1 | `sudo erhai-lab dryrun --wifi L1` | Wi-Fi drops to `unavailable`, `cnss_pci` unbinds and rebinds, `wlan.ko` reloads, Wi-Fi reconnects; dmesg signature shows **no** `erhai-cc`/`pwrseq` lines |
 | D4 Wi-Fi L2 | `sudo erhai-lab dryrun --wifi L2` | exactly one pwrseq power-off on unbind and one clean `erhai-cc` bring-up on rebind, no SError/NoC lines, Wi-Fi reconnects |
 | D5 guard | `sudo erhai-lab dryrun --wifi L1 --fail-at wifi-unbind-l1` | `ABORTED at pre-wifi-unbind-l1`, completed steps undone in reverse, no undo errors |
 | D6 alarm readback | `sudo erhai-lab dryrun --alarm 30` | `alarm-arm` completes (readback within 3 s of the request) |
@@ -51,6 +51,13 @@ For D3–D5 the dry run turns the Wi-Fi radio off itself, stays down at least
 NetworkManager is not touching the chip at the same time. On a real attempt
 NetworkManager turns the radio off by itself on PrepareForSleep, and the hook
 never issues a second radio-off (D15).
+
+The L1 rebind reloads `wlan.ko` (`rmmod wlan; modprobe wlan`) after binding
+`cnss_pci`: the cnss_pci unbind unregisters the qcacld host driver and a
+rebind never probes it again, so without the reload the Wi-Fi device stays
+gone until a reboot. If an older build left Wi-Fi without a device
+(`wlan=(no device)`, `wifi-settle` aborting at once), recover with
+`sudo rmmod wlan; sudo modprobe wlan; nmcli radio wifi on`, or reboot.
 
 **D4 can reset the SoC** (the WCN cold bring-up the dev saw fail). The dry run
 syncs and journals before it starts, so a reset is attributable. After any
