@@ -299,3 +299,8 @@ is only a comparison run.
   `notifier callback qcom_pcie_wcn_l1ss_notify already registered` warning
   after resume comes from every WLAN idle restart (also at 9 s, 32 s and
   128 s of this boot), not from sleep.
+- **Pull request opened (2026-10-22):**
+  https://github.com/TheMojoMan/oneplus-erhai-linux/pull/1, three
+  kernel-style commits on `7.3-rc5` (Wi-Fi napi kill, touch suspend sync,
+  USB PCS power-up), each with `Fixes:`, `Assisted-by: LLM` and the user's
+  sign-off. Candidate `53-pr-final` builds those exact commits.
